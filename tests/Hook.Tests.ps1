@@ -3,6 +3,7 @@
 $pluginRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\plugins\agent-bell')).Path
 $enqueuePath = Join-Path $pluginRoot 'hooks\enqueue.ps1'
 $workerPath = Join-Path $pluginRoot 'scripts\worker.ps1'
+$prewarmPath = Join-Path $pluginRoot 'scripts\prewarm.ps1'
 $modulePath = Join-Path $pluginRoot 'scripts\AgentBell.Core.psm1'
 Import-Module $modulePath -Force -DisableNameChecking
 
@@ -43,6 +44,67 @@ function Invoke-AgentBellHookProcess {
     }
 }
 
+function Get-AgentBellTestPort {
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Start-AgentBellTestServer {
+    param(
+        [int]$Port,
+        [int]$StatusCode,
+        [string]$ContentType,
+        [byte[]]$ResponseBody,
+        [int]$DelayMilliseconds = 0
+    )
+
+    $job = Start-Job -ArgumentList $Port, $StatusCode, $ContentType, $ResponseBody, $DelayMilliseconds -ScriptBlock {
+        param($Port, $StatusCode, $ContentType, [byte[]]$ResponseBody, $DelayMilliseconds)
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+        $listener.Start()
+        try {
+            $context = $listener.GetContext()
+            $reader = New-Object System.IO.StreamReader($context.Request.InputStream, [System.Text.Encoding]::UTF8)
+            try {
+                $body = $reader.ReadToEnd()
+            }
+            finally {
+                $reader.Dispose()
+            }
+            if ($DelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $DelayMilliseconds
+            }
+            try {
+                $context.Response.StatusCode = $StatusCode
+                $context.Response.ContentType = $ContentType
+                $context.Response.ContentLength64 = $ResponseBody.Length
+                $context.Response.OutputStream.Write($ResponseBody, 0, $ResponseBody.Length)
+                $context.Response.Close()
+            }
+            catch {
+                # Timeout tests may close the client before the response is written.
+            }
+            [pscustomobject]@{
+                path = $context.Request.Url.AbsolutePath
+                body = $body
+            }
+        }
+        finally {
+            $listener.Stop()
+            $listener.Close()
+        }
+    }
+    Start-Sleep -Milliseconds 400
+    return $job
+}
+
 Describe 'Agent Bell hook queue' {
     BeforeEach {
         $script:dataDir = Join-Path $env:TEMP ('agent-bell-test-' + [guid]::NewGuid().ToString('N'))
@@ -51,6 +113,176 @@ Describe 'Agent Bell hook queue' {
 
     AfterEach {
         Remove-Item -LiteralPath $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'ships the detached prewarm entry point' {
+        Test-Path -LiteralPath $prewarmPath -PathType Leaf | Should Be $true
+    }
+
+    It 'propagates the resolved Codex home to the background worker' {
+        $enqueueSource = Get-Content -Raw -Encoding UTF8 -LiteralPath $enqueuePath
+        $enqueueSource | Should Match '"-CodexHome"\s*,\s*\(''"''\s*\+\s*\$CodexHome'
+    }
+
+    It 'never deletes a prewarm request outside its private ticket directory' {
+        $outsidePath = Join-Path $script:dataDir 'outside-prewarm.json'
+        [System.IO.File]::WriteAllText($outsidePath, '{"private":"keep"}', (New-Object System.Text.UTF8Encoding($false)))
+
+        & $prewarmPath `
+            -PluginRoot $pluginRoot `
+            -DataDir $script:dataDir `
+            -CodexHome (Join-Path $script:dataDir 'codex-home') `
+            -RequestPath $outsidePath `
+            -DelaySeconds 0
+
+        Test-Path -LiteralPath $outsidePath -PathType Leaf | Should Be $true
+        Get-Content -Raw -Encoding UTF8 -LiteralPath $outsidePath | Should Be '{"private":"keep"}'
+    }
+
+    It 'prewarms the exact completion announcement only for an active turn with a real Codex title' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 202 -ContentType 'application/json' -ResponseBody $responseBody
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+            $sessionId = '56565656-5656-5656-5656-565656565656'
+            $turnId = 'turn-prewarm-exact-title'
+            $codexHome = Join-Path $script:dataDir 'codex-home'
+            New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+            $titleRow = [ordered]@{
+                id = $sessionId
+                thread_name = '真实 Codex 会话名'
+                updated_at = '2026-07-13T00:00:00Z'
+            } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+
+            $state = Get-AgentBellState
+            $state = Set-AgentBellTurnStart -State $state -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+
+            $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+            New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+            $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+            Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+                schema_version = 1
+                session_id = $sessionId
+                turn_id = $turnId
+                thread_source = 'user'
+            })
+
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            & $prewarmPath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -RequestPath $requestPath -DelaySeconds 7
+            $stopwatch.Stop()
+
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $payload = $result.body | ConvertFrom-Json
+            $result.path | Should Be '/prewarm'
+            $payload.text | Should Be '主人，真实 Codex 会话名 任务已完成，请回来查看了。'
+            $payload.voice_id | Should Be 'default'
+            ($stopwatch.ElapsedMilliseconds -lt 3000) | Should Be $true
+            Test-Path -LiteralPath $requestPath | Should Be $false
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'does not prewarm an automation ticket even when its turn and title exist' {
+        $config = Get-AgentBellDefaultConfig
+        $config.voice.provider = 'http'
+        $config.voice.http.endpoint = 'http://127.0.0.1:9/synthesize'
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $sessionId = '67676767-6767-6767-6767-676767676767'
+        $turnId = 'turn-automation-prewarm'
+        $codexHome = Join-Path $script:dataDir 'codex-home'
+        New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+        $titleRow = [ordered]@{ id = $sessionId; thread_name = '自动化会话' } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+        $state = Get-AgentBellState
+        $state = Set-AgentBellTurnStart -State $state -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+        $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+        New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+        $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+        Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+            schema_version = 1
+            session_id = $sessionId
+            turn_id = $turnId
+            thread_source = 'automation'
+        })
+
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        & $prewarmPath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -RequestPath $requestPath -DelaySeconds 0
+        $stopwatch.Stop()
+
+        ($stopwatch.ElapsedMilliseconds -lt 1000) | Should Be $true
+        Test-Path -LiteralPath $requestPath | Should Be $false
+    }
+
+    It 'downloads a cached custom WAV without calling synthesis' {
+        $port = Get-AgentBellTestPort
+        $wav = New-Object byte[] 44
+        [System.Text.Encoding]::ASCII.GetBytes('RIFF').CopyTo($wav, 0)
+        [System.Text.Encoding]::ASCII.GetBytes('WAVE').CopyTo($wav, 8)
+        [System.Text.Encoding]::ASCII.GetBytes('fmt ').CopyTo($wav, 12)
+        [System.Text.Encoding]::ASCII.GetBytes('data').CopyTo($wav, 36)
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 200 -ContentType 'audio/wav' -ResponseBody $wav
+        $outputPath = Join-Path $script:dataDir 'cached.wav'
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+
+            $hit = Request-AgentBellCachedVoice -Message '主人，缓存测试 任务已完成，请回来查看了。' -Config $config -OutputPath $outputPath
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $payload = $result.body | ConvertFrom-Json
+
+            $hit | Should Be $true
+            $result.path | Should Be '/cached'
+            $payload.text | Should Be '主人，缓存测试 任务已完成，请回来查看了。'
+            $payload.voice_id | Should Be 'default'
+            (Get-Item -LiteralPath $outputPath).Length | Should Be 44
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'caps a cached lookup at two seconds and leaves no partial WAV' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"cache_miss"}')
+        $server = Start-AgentBellTestServer `
+            -Port $port `
+            -StatusCode 404 `
+            -ContentType 'application/json' `
+            -ResponseBody $responseBody `
+            -DelayMilliseconds 5000
+        $outputPath = Join-Path $script:dataDir 'slow-cache.wav'
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            $config.voice.http.timeout_seconds = 300
+
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            $hit = Request-AgentBellCachedVoice -Message 'private title' -Config $config -OutputPath $outputPath
+            $stopwatch.Stop()
+
+            $hit | Should Be $false
+            ($stopwatch.ElapsedMilliseconds -lt 3000) | Should Be $true
+            Test-Path -LiteralPath $outputPath | Should Be $false
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'queues only sanitized prompt-start metadata' {
@@ -250,6 +482,57 @@ Describe 'Agent Bell hook queue' {
         $log | Should Not Match '33333333-3333-3333-3333-333333333333'
     }
 
+    It 'removes a completed turn from active state without launching prewarm in dry-run mode' {
+        $config = Get-AgentBellDefaultConfig
+        $config.stop_debounce_seconds = 0
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $sessionId = '45454545-4545-4545-4545-454545454545'
+        $turnId = 'turn-finished-before-prewarm'
+        $startPayload = [ordered]@{
+            hook_event_name = 'UserPromptSubmit'
+            session_id = $sessionId
+            turn_id = $turnId
+            cwd = 'C:\work\private-name'
+            prompt = 'private'
+        } | ConvertTo-Json -Compress
+        $stopPayload = [ordered]@{
+            hook_event_name = 'Stop'
+            session_id = $sessionId
+            turn_id = $turnId
+            cwd = 'C:\work\private-name'
+            stop_hook_active = $false
+            last_assistant_message = 'Done.'
+        } | ConvertTo-Json -Compress
+
+        & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -TestJson $startPayload -NoWorker
+        & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -TestJson $stopPayload -NoWorker
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $state = Get-AgentBellState -Path (Join-Path $script:dataDir 'state\state.json')
+        Test-AgentBellTurnActive -State $state -Key "$sessionId|$turnId" | Should Be $false
+        @(Get-ChildItem -LiteralPath (Join-Path $script:dataDir 'queue\prewarm') -Filter '*.json' -File).Count | Should Be 0
+    }
+
+    It 'prunes abandoned prewarm tickets with the normal queue retention policy' {
+        $config = Get-AgentBellDefaultConfig
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+        $prewarmDirectory = Join-Path $script:dataDir 'queue\prewarm'
+        New-Item -ItemType Directory -Force -Path $prewarmDirectory | Out-Null
+        $ticketPath = Join-Path $prewarmDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+        Write-AgentBellJsonAtomic -Path $ticketPath -Value ([ordered]@{
+            schema_version = 1
+            session_id = '89898989-8989-8989-8989-898989898989'
+            turn_id = 'abandoned'
+            thread_source = 'user'
+        })
+        (Get-Item -LiteralPath $ticketPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        Test-Path -LiteralPath $ticketPath | Should Be $false
+    }
+
     It 'deduplicates repeated stop events' {
         $config = Get-AgentBellDefaultConfig
         $config.stop_debounce_seconds = 0
@@ -268,8 +551,63 @@ Describe 'Agent Bell hook queue' {
         & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
 
         $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
-        @($lines | Where-Object { $_ -match 'Processed attention event' }).Count | Should Be 1
-        @($lines | Where-Object { $_ -match 'Skipped duplicate event' }).Count | Should Be 1
+        $processed = @($lines | Where-Object { $_ -match 'Processed attention event' })
+        $processed.Count | Should Be 1
+        $processed[0] | Should Match '"event":"complete"'
+        @($lines | Where-Object { $_ -match 'Suppressed a Stop candidate' }).Count | Should Be 1
+    }
+
+    It 'deduplicates initial and continued Stop events with zero debounce' {
+        $config = Get-AgentBellDefaultConfig
+        $config.stop_debounce_seconds = 0
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        foreach ($active in @($false, $true)) {
+            $payload = [ordered]@{
+                hook_event_name = 'Stop'
+                session_id = '91919191-9191-9191-9191-919191919191'
+                turn_id = 'same-zero-debounce-turn'
+                cwd = 'C:\work\project'
+                stop_hook_active = $active
+                last_assistant_message = if ($active) { 'Task failed: final continuation failed.' } else { 'Done.' }
+            } | ConvertTo-Json -Compress
+            & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -TestJson $payload -NoWorker
+            Start-Sleep -Milliseconds 50
+        }
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
+        $processed = @($lines | Where-Object { $_ -match 'Processed attention event' })
+        $processed.Count | Should Be 1
+        $processed[0] | Should Match '"event":"failure"'
+        $processed[0] | Should Not Match '"event":"complete"'
+        @($lines | Where-Object { $_ -match 'Suppressed a Stop candidate' }).Count | Should Be 1
+    }
+
+    It 'keeps Stop notifications for different turns independent at zero debounce' {
+        $config = Get-AgentBellDefaultConfig
+        $config.stop_debounce_seconds = 0
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        foreach ($turnId in @('zero-debounce-turn-a', 'zero-debounce-turn-b')) {
+            $payload = [ordered]@{
+                hook_event_name = 'Stop'
+                session_id = '92929292-9292-9292-9292-929292929292'
+                turn_id = $turnId
+                cwd = 'C:\work\project'
+                stop_hook_active = $false
+                last_assistant_message = 'Done.'
+            } | ConvertTo-Json -Compress
+            & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -TestJson $payload -NoWorker
+            Start-Sleep -Milliseconds 50
+        }
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
+        @($lines | Where-Object { $_ -match 'Processed attention event' }).Count | Should Be 2
+        @($lines | Where-Object { $_ -match 'Skipped duplicate event' }).Count | Should Be 0
     }
 
     It 'suppresses an initial Stop candidate when the same session becomes active during debounce' {
@@ -303,6 +641,67 @@ Describe 'Agent Bell hook queue' {
         $log | Should Not Match 'Processed attention event.*complete'
     }
 
+    It 'retires an old Stop when a later different turn becomes active' {
+        $config = Get-AgentBellDefaultConfig
+        $config.stop_debounce_seconds = 1
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $sessionId = '94949494-9494-9494-9494-949494949494'
+        $oldTurnId = 'old-turn'
+        $newTurnId = 'new-turn'
+        $pendingDirectory = Join-Path $script:dataDir 'queue\pending'
+        New-Item -ItemType Directory -Force -Path $pendingDirectory | Out-Null
+        $oldStart = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'UserPromptSubmit'
+            session_id = $sessionId
+            turn_id = $oldTurnId
+            cwd = 'C:\work\project'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:00Z'))
+        $oldStop = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'Stop'
+            session_id = $sessionId
+            turn_id = $oldTurnId
+            cwd = 'C:\work\project'
+            stop_hook_active = $false
+            last_assistant_message = 'Done.'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:05Z'))
+        $newStart = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'UserPromptSubmit'
+            session_id = $sessionId
+            turn_id = $newTurnId
+            cwd = 'C:\work\project'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:06Z'))
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '001-old-start.json') -Value $oldStart
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '002-old-stop.json') -Value $oldStop
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '003-new-start.json') -Value $newStart
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $statePath = Join-Path $script:dataDir 'state\state.json'
+        $state = Get-AgentBellState -Path $statePath
+        Test-AgentBellTurnActive -State $state -Key "$sessionId|$oldTurnId" | Should Be $false
+        Test-AgentBellTurnActive -State $state -Key "$sessionId|$newTurnId" | Should Be $true
+        Test-AgentBellHandled -State $state -Key ([string]$oldStop.dedupe_key) | Should Be $true
+
+        $retriedOldStop = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'Stop'
+            session_id = $sessionId
+            turn_id = $oldTurnId
+            cwd = 'C:\work\project'
+            stop_hook_active = $true
+            last_assistant_message = 'Done.'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:07Z'))
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '004-retried-old-stop.json') -Value $retriedOldStop
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
+        @($lines | Where-Object { $_ -match 'Processed attention event' -and $_ -match '"event":"complete"' }).Count | Should Be 0
+        @($lines | Where-Object { $_ -match 'Skipped duplicate event' }).Count | Should Be 1
+        $state = Get-AgentBellState -Path $statePath
+        @($state.turns).Count | Should Be 1
+        Test-AgentBellTurnActive -State $state -Key "$sessionId|$newTurnId" | Should Be $true
+    }
+
     It 'suppresses an earlier Stop candidate when a continued Stop arrives during debounce' {
         $config = Get-AgentBellDefaultConfig
         $config.stop_debounce_seconds = 1
@@ -326,6 +725,53 @@ Describe 'Agent Bell hook queue' {
         $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
         @($lines | Where-Object { $_ -match 'Suppressed a Stop candidate' }).Count | Should Be 1
         @($lines | Where-Object { $_ -match 'Processed attention event' -and $_ -match '"event":"complete"' }).Count | Should Be 1
+    }
+
+    It 'preserves turn duration and threshold decision for the final continued Stop' {
+        $config = Get-AgentBellDefaultConfig
+        $config.mode = 'threshold'
+        $config.duration_threshold_seconds = 10
+        $config.stop_debounce_seconds = 1
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $sessionId = '93939393-9393-9393-9393-939393939393'
+        $turnId = 'continued-duration-turn'
+        $pendingDirectory = Join-Path $script:dataDir 'queue\pending'
+        New-Item -ItemType Directory -Force -Path $pendingDirectory | Out-Null
+        $start = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'UserPromptSubmit'
+            session_id = $sessionId
+            turn_id = $turnId
+            cwd = 'C:\work\project'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:00Z'))
+        $initial = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'Stop'
+            session_id = $sessionId
+            turn_id = $turnId
+            cwd = 'C:\work\project'
+            stop_hook_active = $false
+            last_assistant_message = 'Done.'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:15Z'))
+        $continued = ConvertTo-AgentBellEvent -Payload ([pscustomobject][ordered]@{
+            hook_event_name = 'Stop'
+            session_id = $sessionId
+            turn_id = $turnId
+            cwd = 'C:\work\project'
+            stop_hook_active = $true
+            last_assistant_message = 'Done.'
+        }) -CapturedAt ([DateTimeOffset]::Parse('2026-07-13T00:00:16Z'))
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '001-start.json') -Value $start
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '002-initial-stop.json') -Value $initial
+        Write-AgentBellJsonAtomic -Path (Join-Path $pendingDirectory '003-continued-stop.json') -Value $continued
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $lines = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl'))
+        @($lines | Where-Object { $_ -match 'Suppressed a Stop candidate' }).Count | Should Be 1
+        $processed = @($lines | Where-Object { $_ -match 'Processed attention event' -and $_ -match '"event":"complete"' })
+        $processed.Count | Should Be 1
+        $processed[0] | Should Match '"decision":"speak"'
+        $processed[0] | Should Match '"duration_seconds":16'
     }
 
     It 'recovers an orphaned processing event after a worker interruption' {

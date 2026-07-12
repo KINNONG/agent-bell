@@ -1,8 +1,38 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $setupPath = Join-Path $PSScriptRoot '..\plugins\agent-bell\scripts\setup.ps1'
+$voicePackUpdatePath = Join-Path $PSScriptRoot '..\plugins\agent-bell\voice-pack\update.ps1'
 $pluginRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\plugins\agent-bell'))
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$updateTokens = $null
+$updateParseErrors = $null
+$updateAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $voicePackUpdatePath,
+    [ref]$updateTokens,
+    [ref]$updateParseErrors
+)
+if (@($updateParseErrors).Count -gt 0) {
+    throw 'The Voice Pack updater could not be parsed for setup tests.'
+}
+$updateFunctionNames = @(
+    'Test-ReparsePoint',
+    'Assert-VoicePackRuntimeDestination',
+    'Test-VoicePackTransactionCanBeRemoved',
+    'Get-VoicePackRecoveryDetail',
+    'Restore-VoicePackRuntime'
+)
+foreach ($functionName in $updateFunctionNames) {
+    $functionAst = @($updateAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+    }, $true))[0]
+    if ($null -eq $functionAst) {
+        throw "Voice Pack updater function was not found: $functionName"
+    }
+    . ([scriptblock]::Create($functionAst.Extent.Text))
+}
 
 function Write-TestJson {
     param([string]$Path, [object]$Value)
@@ -272,5 +302,136 @@ Describe 'Agent Bell setup lifecycle' {
         $doctor.TrustState | Should Be 'not modified or inferred'
         [System.IO.File]::ReadAllText($testEnvironment.ConfigPath, $utf8NoBom) |
             Should Be $testEnvironment.OriginalConfig
+    }
+
+    It 'keeps SAPI installs independent of the optional Voice Pack' {
+        $null = Invoke-SetupAction -Action 'Initialize' -Environment $testEnvironment
+
+        $doctor = Invoke-SetupAction -Action 'Doctor' -Environment $testEnvironment
+
+        $doctor.Success | Should Be $true
+        @($doctor.Checks | Where-Object { $_.Name -eq 'voice-pack-low-latency' }).Count |
+            Should Be 0
+    }
+
+    It 'fails Doctor clearly when the configured HTTP Voice Pack is unavailable' {
+        $null = Invoke-SetupAction -Action 'Initialize' -Environment $testEnvironment
+        $runtimeConfigPath = Join-Path $testEnvironment.DataDir 'config.json'
+        $runtimeConfig = [System.IO.File]::ReadAllText($runtimeConfigPath, $utf8NoBom) | ConvertFrom-Json
+        $runtimeConfig.voice.provider = 'http'
+        $runtimeConfig.voice.http.endpoint = 'http://127.0.0.1:1/synthesize'
+        Write-TestJson -Path $runtimeConfigPath -Value $runtimeConfig
+
+        $doctor = Invoke-SetupAction -Action 'Doctor' -Environment $testEnvironment
+        $voicePackCheck = @($doctor.Checks | Where-Object { $_.Name -eq 'voice-pack-low-latency' })[0]
+
+        $doctor.Success | Should Be $false
+        $voicePackCheck.Passed | Should Be $false
+        $voicePackCheck.Detail | Should Match 'unavailable'
+    }
+
+    It 'refuses to update an unmarked directory without changing its contents' {
+        $unmarkedRoot = Join-Path $testEnvironment.Root 'unmarked-voice-pack'
+        [System.IO.Directory]::CreateDirectory($unmarkedRoot) | Out-Null
+        $privateSentinel = Join-Path $unmarkedRoot 'private-sentinel.txt'
+        [System.IO.File]::WriteAllText($privateSentinel, 'keep', $utf8NoBom)
+
+        { & $voicePackUpdatePath -InstallRoot $unmarkedRoot -ReadyTimeoutSeconds 30 } |
+            Should Throw
+
+        [System.IO.File]::ReadAllText($privateSentinel, $utf8NoBom) | Should Be 'keep'
+        @(Get-ChildItem -LiteralPath $unmarkedRoot -Force).Count | Should Be 1
+    }
+
+    It 'rolls back only runtime files whose replacement completed' {
+        $voicePackRoot = Join-Path $testEnvironment.Root 'rollback-voice-pack'
+        $appDirectory = Join-Path $voicePackRoot 'app'
+        $backupDirectory = Join-Path $voicePackRoot 'transaction\backup'
+        foreach ($directory in @(
+            $appDirectory,
+            $backupDirectory,
+            (Join-Path $voicePackRoot 'voices'),
+            (Join-Path $voicePackRoot 'models'),
+            (Join-Path $voicePackRoot '.venv')
+        )) {
+            [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+        }
+
+        $serverPath = Join-Path $appDirectory 'server.py'
+        $startPath = Join-Path $appDirectory 'start.ps1'
+        [System.IO.File]::WriteAllText($serverPath, 'new server', $utf8NoBom)
+        [System.IO.File]::WriteAllText($startPath, 'original start', $utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path $backupDirectory 'server.py'), 'old server', $utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path $backupDirectory 'start.ps1'), 'original start', $utf8NoBom)
+        foreach ($privateDirectory in @('voices', 'models', '.venv')) {
+            [System.IO.File]::WriteAllText(
+                (Join-Path $voicePackRoot "$privateDirectory\private-sentinel.txt"),
+                'keep',
+                $utf8NoBom
+            )
+        }
+        $records = @(
+            [pscustomobject]@{ Sequence = 0; Name = 'server.py'; HadOriginal = $true; Replaced = $true },
+            [pscustomobject]@{ Sequence = 1; Name = 'start.ps1'; HadOriginal = $true; Replaced = $false }
+        )
+
+        $lockedStart = [System.IO.File]::Open(
+            $startPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            { Restore-VoicePackRuntime -AppDirectory $appDirectory -BackupDirectory $backupDirectory -Records $records } |
+                Should Not Throw
+        }
+        finally {
+            $lockedStart.Dispose()
+        }
+
+        [System.IO.File]::ReadAllText($serverPath, $utf8NoBom) | Should Be 'old server'
+        [System.IO.File]::ReadAllText($startPath, $utf8NoBom) | Should Be 'original start'
+        @(Get-ChildItem -LiteralPath $appDirectory -Filter '.agent-bell-restore-*' -Force).Count | Should Be 0
+        foreach ($privateDirectory in @('voices', 'models', '.venv')) {
+            [System.IO.File]::ReadAllText(
+                (Join-Path $voicePackRoot "$privateDirectory\private-sentinel.txt"),
+                $utf8NoBom
+            ) | Should Be 'keep'
+        }
+    }
+
+    It 'rejects a runtime destination that is a directory' {
+        $appDirectory = Join-Path $testEnvironment.Root 'directory-runtime\app'
+        $backupDirectory = Join-Path $testEnvironment.Root 'directory-runtime\backup'
+        $directoryDestination = Join-Path $appDirectory 'server.py'
+        [System.IO.Directory]::CreateDirectory($directoryDestination) | Out-Null
+        [System.IO.Directory]::CreateDirectory($backupDirectory) | Out-Null
+        $sentinel = Join-Path $directoryDestination 'keep.txt'
+        [System.IO.File]::WriteAllText($sentinel, 'keep', $utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path $backupDirectory 'server.py'), 'old server', $utf8NoBom)
+        $records = @(
+            [pscustomobject]@{ Sequence = 0; Name = 'server.py'; HadOriginal = $true; Replaced = $true }
+        )
+
+        { Restore-VoicePackRuntime -AppDirectory $appDirectory -BackupDirectory $backupDirectory -Records $records } |
+            Should Throw
+
+        (Test-Path -LiteralPath $directoryDestination -PathType Container) | Should Be $true
+        [System.IO.File]::ReadAllText($sentinel, $utf8NoBom) | Should Be 'keep'
+        @(Get-ChildItem -LiteralPath $directoryDestination -Force).Count | Should Be 1
+        @(Get-ChildItem -LiteralPath $appDirectory -Filter '.agent-bell-restore-*' -Force).Count | Should Be 0
+    }
+
+    It 'keeps recovery files unless update or rollback completed safely' {
+        (Test-VoicePackTransactionCanBeRemoved -UpdateCompleted $false -RollbackCompleted $false) |
+            Should Be $false
+        (Test-VoicePackTransactionCanBeRemoved -UpdateCompleted $true -RollbackCompleted $false) |
+            Should Be $true
+        (Test-VoicePackTransactionCanBeRemoved -UpdateCompleted $false -RollbackCompleted $true) |
+            Should Be $true
+
+        $transactionPath = Join-Path $testEnvironment.Root '.agent-bell-runtime-update-test'
+        (Get-VoicePackRecoveryDetail -TransactionPath $transactionPath) |
+            Should Be "Recovery files were preserved at: $transactionPath"
     }
 }

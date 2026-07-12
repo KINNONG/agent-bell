@@ -447,14 +447,12 @@ function Get-AgentBellRolloutThreadSource {
     return "unknown"
 }
 
-function Get-AgentBellConversationTitle {
+function Get-AgentBellRealConversationTitle {
     param(
         [string]$CodexHome,
         [string]$SessionId,
-        [string]$Cwd,
         [string]$SessionIndexPath,
-        [Alias("MaxLength")][int]$MaxCharacters = 60,
-        [string]$FallbackTitle = "当前 Codex 会话"
+        [Alias("MaxLength")][int]$MaxCharacters = 60
     )
 
     if ([string]::IsNullOrWhiteSpace($CodexHome)) {
@@ -492,13 +490,35 @@ function Get-AgentBellConversationTitle {
             }
         }
         catch {
-            # Continue to stable fallbacks.
+            # Continue to the local Codex database.
         }
     }
 
     $sqliteTitle = Get-AgentBellSqliteTitle -CodexHome $CodexHome -SessionId $SessionId -MaxCharacters $MaxCharacters
     if (-not [string]::IsNullOrWhiteSpace($sqliteTitle)) {
         return $sqliteTitle
+    }
+
+    return $null
+}
+
+function Get-AgentBellConversationTitle {
+    param(
+        [string]$CodexHome,
+        [string]$SessionId,
+        [string]$Cwd,
+        [string]$SessionIndexPath,
+        [Alias("MaxLength")][int]$MaxCharacters = 60,
+        [string]$FallbackTitle = "当前 Codex 会话"
+    )
+
+    $title = Get-AgentBellRealConversationTitle `
+        -CodexHome $CodexHome `
+        -SessionId $SessionId `
+        -SessionIndexPath $SessionIndexPath `
+        -MaxCharacters $MaxCharacters
+    if (-not [string]::IsNullOrWhiteSpace($title)) {
+        return $title
     }
 
     if (-not [string]::IsNullOrWhiteSpace($Cwd)) {
@@ -584,7 +604,12 @@ function ConvertTo-AgentBellEvent {
     }
     $fingerprint = (Get-AgentBellHash -Value $fingerprintInput).Substring(0, 12)
 
-    $dedupeSuffix = if ($eventName -eq "Stop") { [string]$stopHookActive } else { $fingerprint }
+    $dedupeKey = if ($eventName -eq "Stop") {
+        "$sessionId|$turnId|Stop"
+    }
+    else {
+        "$sessionId|$turnId|$kind|$toolName|$fingerprint"
+    }
     return [pscustomobject][ordered]@{
         schema_version = 1
         event = $eventName
@@ -597,7 +622,7 @@ function ConvertTo-AgentBellEvent {
         stop_hook_active = $stopHookActive
         attempt = 0
         captured_at = $CapturedAt.ToString("o")
-        dedupe_key = "$sessionId|$turnId|$kind|$toolName|$dedupeSuffix"
+        dedupe_key = $dedupeKey
     }
 }
 
@@ -639,6 +664,25 @@ function Set-AgentBellTurnStart {
     return $State
 }
 
+function Test-AgentBellTurnActive {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [string]$Key
+    )
+
+    return $null -ne ($State.turns | Where-Object { [string]$_.key -eq $Key } | Select-Object -First 1)
+}
+
+function Remove-AgentBellTurnStart {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [string]$Key
+    )
+
+    $State.turns = @($State.turns | Where-Object { [string]$_.key -ne $Key })
+    return $State
+}
+
 function Get-AgentBellTurnDurationSeconds {
     param(
         [Parameter(Mandatory = $true)][object]$State,
@@ -658,6 +702,27 @@ function Get-AgentBellTurnDurationSeconds {
     catch {
         return $null
     }
+}
+
+function Get-AgentBellEventDurationSeconds {
+    param(
+        [Parameter(Mandatory = $true)][object]$Event,
+        [Parameter(Mandatory = $true)][object]$State,
+        [string]$Key,
+        [string]$StoppedAt
+    )
+
+    $durationProperty = $Event.PSObject.Properties["duration_seconds"]
+    if ($null -ne $durationProperty) {
+        if ($null -eq $durationProperty.Value) {
+            return $null
+        }
+        return [double]$durationProperty.Value
+    }
+
+    $duration = Get-AgentBellTurnDurationSeconds -State $State -Key $Key -StoppedAt $StoppedAt
+    $Event | Add-Member -MemberType NoteProperty -Name "duration_seconds" -Value $duration
+    return $duration
 }
 
 function Get-AgentBellDebounceWaitMilliseconds {
@@ -738,6 +803,23 @@ function Get-AgentBellDecision {
             return "notify"
         }
     }
+}
+
+function Test-AgentBellShouldPrewarm {
+    param(
+        [Parameter(Mandatory = $true)][object]$Event,
+        [Parameter(Mandatory = $true)][object]$Config,
+        [bool]$DryRun = $false
+    )
+
+    if ($DryRun -or -not [bool]$Config.enabled -or [string]$Config.voice.provider -ne "http") {
+        return $false
+    }
+    if ([string](Get-AgentBellProperty -Object $Event -Name "kind") -ne "start") {
+        return $false
+    }
+    $threadSource = [string](Get-AgentBellProperty -Object $Event -Name "thread_source" -Default "unknown")
+    return $threadSource -ne "automation" -or [string]$Config.notifications.automation_runs -eq "normal"
 }
 
 function Get-AgentBellCompletionAction {
@@ -884,16 +966,14 @@ function Invoke-AgentBellSapi {
     }
 }
 
-function Invoke-AgentBellHttpVoice {
+function Resolve-AgentBellLoopbackUri {
     param(
-        [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][object]$Config,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [string]$Path
     )
 
-    $endpoint = [string]$Config.voice.http.endpoint
     try {
-        $uri = [Uri]$endpoint
+        $uri = [Uri]$Endpoint
     }
     catch {
         throw "The local voice endpoint is not a valid URI."
@@ -904,6 +984,10 @@ function Invoke-AgentBellHttpVoice {
     if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) {
         throw "The local voice endpoint cannot include credentials."
     }
+    if (-not [string]::IsNullOrWhiteSpace($uri.Query) -or -not [string]::IsNullOrWhiteSpace($uri.Fragment)) {
+        throw "The local voice endpoint cannot include a query or fragment."
+    }
+
     $literalAddress = $null
     if ([System.Net.IPAddress]::TryParse($uri.DnsSafeHost, [ref]$literalAddress)) {
         if (-not [System.Net.IPAddress]::IsLoopback($literalAddress)) {
@@ -925,89 +1009,231 @@ function Invoke-AgentBellHttpVoice {
         }
     }
 
-    $timeoutMs = [Math]::Max(1000, [int]$Config.voice.http.timeout_seconds * 1000)
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
-    $maxWavBytes = [Math]::Max(44, [int64]$Config.limits.max_wav_bytes)
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        if (-not $Path.StartsWith('/') -or $Path.Contains('?') -or $Path.Contains('#') -or $Path.Contains('\')) {
+            throw "The local voice endpoint path is invalid."
+        }
+        $builder = New-Object System.UriBuilder($uri)
+        $builder.Path = $Path
+        $builder.Query = ""
+        $builder.Fragment = ""
+        $uri = $builder.Uri
+    }
+    return $uri
+}
+
+function New-AgentBellVoiceHttpRequest {
+    param(
+        [Parameter(Mandatory = $true)][Uri]$Uri,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs,
+        [Parameter(Mandatory = $true)][string]$Accept
+    )
+
     $payload = [ordered]@{
         text = $Message
         voice_id = [string]$Config.voice.http.voice_id
     } | ConvertTo-Json -Compress
     $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
-
-    $request = [System.Net.HttpWebRequest]::Create($uri)
+    $request = [System.Net.HttpWebRequest]::Create($Uri)
     $request.Method = "POST"
     $request.ContentType = "application/json; charset=utf-8"
-    $request.Accept = "audio/wav"
-    $request.Timeout = $timeoutMs
-    $request.ReadWriteTimeout = $timeoutMs
+    $request.Accept = $Accept
+    $request.Timeout = $TimeoutMs
+    $request.ReadWriteTimeout = $TimeoutMs
     $request.ContentLength = $payloadBytes.Length
     $request.AllowAutoRedirect = $false
 
-    $requestStream = $request.GetRequestStream()
+    return [pscustomobject]@{
+        request = $request
+        payload_bytes = $payloadBytes
+        deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    }
+}
+
+function Get-AgentBellVoiceHttpResponse {
+    param([Parameter(Mandatory = $true)][object]$Context)
+
+    $requestStream = $Context.request.GetRequestStream()
     try {
-        $requestStream.Write($payloadBytes, 0, $payloadBytes.Length)
+        $requestStream.Write($Context.payload_bytes, 0, $Context.payload_bytes.Length)
     }
     finally {
         $requestStream.Dispose()
     }
+    return $Context.request.GetResponse()
+}
 
-    $response = $request.GetResponse()
+function Save-AgentBellVoiceWavResponse {
+    param(
+        [Parameter(Mandatory = $true)][object]$Response,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][int64]$MaxWavBytes
+    )
+
+    $contentType = ([string]$Response.ContentType).Split(';')[0].Trim().ToLowerInvariant()
+    if ($contentType -notin @("audio/wav", "audio/x-wav", "audio/wave")) {
+        throw "The local voice provider returned an unexpected content type."
+    }
+    if ($Response.ContentLength -gt $MaxWavBytes) {
+        throw "The local voice provider returned a WAV larger than the configured limit."
+    }
+
+    $responseStream = $Response.GetResponseStream()
     try {
-        $contentType = ([string]$response.ContentType).Split(';')[0].Trim().ToLowerInvariant()
-        if ($contentType -notin @("audio/wav", "audio/x-wav", "audio/wave")) {
-            throw "The local voice provider returned an unexpected content type."
-        }
-        if ($response.ContentLength -gt $maxWavBytes) {
-            throw "The local voice provider returned a WAV larger than the configured limit."
-        }
-        $responseStream = $response.GetResponseStream()
+        $fileStream = [System.IO.File]::Create($OutputPath)
         try {
-            $fileStream = [System.IO.File]::Create($OutputPath)
-            try {
-                $buffer = New-Object byte[] 65536
-                [int64]$totalBytes = 0
-                while ($true) {
-                    $remainingMs = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-                    if ($remainingMs -le 0) {
-                        throw "The local voice provider exceeded the configured total timeout."
-                    }
-                    if ($responseStream.CanTimeout) {
-                        $responseStream.ReadTimeout = $remainingMs
-                    }
-                    $read = $responseStream.Read($buffer, 0, $buffer.Length)
-                    if ($read -le 0) {
-                        break
-                    }
-                    $totalBytes += $read
-                    if ($totalBytes -gt $maxWavBytes) {
-                        throw "The local voice provider exceeded the configured WAV size limit."
-                    }
-                    $fileStream.Write($buffer, 0, $read)
+            $buffer = New-Object byte[] 65536
+            [int64]$totalBytes = 0
+            while ($true) {
+                $remainingMs = [int][Math]::Ceiling(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                if ($remainingMs -le 0) {
+                    throw "The local voice provider exceeded the configured total timeout."
                 }
-            }
-            finally {
-                $fileStream.Dispose()
+                if ($responseStream.CanTimeout) {
+                    $responseStream.ReadTimeout = $remainingMs
+                }
+                $read = $responseStream.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) {
+                    break
+                }
+                $totalBytes += $read
+                if ($totalBytes -gt $MaxWavBytes) {
+                    throw "The local voice provider exceeded the configured WAV size limit."
+                }
+                $fileStream.Write($buffer, 0, $read)
             }
         }
         finally {
-            $responseStream.Dispose()
+            $fileStream.Dispose()
         }
     }
     finally {
-        $response.Dispose()
+        $responseStream.Dispose()
     }
-
     if (-not (Test-Path -LiteralPath $OutputPath) -or (Get-Item -LiteralPath $OutputPath).Length -lt 44) {
         throw "The local voice provider did not return a valid WAV payload."
     }
+}
 
-    $player = New-Object System.Media.SoundPlayer $OutputPath
+function Invoke-AgentBellWavPlayback {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $player = New-Object System.Media.SoundPlayer $Path
     try {
         $player.PlaySync()
     }
     finally {
         $player.Dispose()
     }
+}
+
+function Invoke-AgentBellHttpVoice {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    $uri = Resolve-AgentBellLoopbackUri -Endpoint ([string]$Config.voice.http.endpoint)
+    $timeoutMs = [Math]::Max(1000, [int]$Config.voice.http.timeout_seconds * 1000)
+    $maxWavBytes = [Math]::Max(44, [int64]$Config.limits.max_wav_bytes)
+    $context = New-AgentBellVoiceHttpRequest -Uri $uri -Message $Message -Config $Config -TimeoutMs $timeoutMs -Accept "audio/wav"
+    $response = Get-AgentBellVoiceHttpResponse -Context $context
+    try {
+        Save-AgentBellVoiceWavResponse -Response $response -Deadline $context.deadline -OutputPath $OutputPath -MaxWavBytes $maxWavBytes
+    }
+    finally {
+        $response.Dispose()
+    }
+    Invoke-AgentBellWavPlayback -Path $OutputPath
+}
+
+function Invoke-AgentBellHttpPrewarm {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object]$Config
+    )
+
+    try {
+        $uri = Resolve-AgentBellLoopbackUri -Endpoint ([string]$Config.voice.http.endpoint) -Path "/prewarm"
+        $timeoutMs = [Math]::Min(2000, [Math]::Max(1000, [int]$Config.voice.http.timeout_seconds * 1000))
+        $context = New-AgentBellVoiceHttpRequest -Uri $uri -Message $Message -Config $Config -TimeoutMs $timeoutMs -Accept "application/json"
+        $response = Get-AgentBellVoiceHttpResponse -Context $context
+        try {
+            $statusCode = [int]$response.StatusCode
+            return $statusCode -ge 200 -and $statusCode -lt 300
+        }
+        finally {
+            $response.Dispose()
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Request-AgentBellCachedVoice {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
+    try {
+        $uri = Resolve-AgentBellLoopbackUri -Endpoint ([string]$Config.voice.http.endpoint) -Path "/cached"
+        $timeoutMs = [Math]::Min(2000, [Math]::Max(1000, [int]$Config.voice.http.timeout_seconds * 1000))
+        $maxWavBytes = [Math]::Max(44, [int64]$Config.limits.max_wav_bytes)
+        $context = New-AgentBellVoiceHttpRequest -Uri $uri -Message $Message -Config $Config -TimeoutMs $timeoutMs -Accept "audio/wav"
+        $response = Get-AgentBellVoiceHttpResponse -Context $context
+        try {
+            if ([int]$response.StatusCode -ne 200) {
+                return $false
+            }
+            Save-AgentBellVoiceWavResponse -Response $response -Deadline $context.deadline -OutputPath $OutputPath -MaxWavBytes $maxWavBytes
+        }
+        finally {
+            $response.Dispose()
+        }
+        return $true
+    }
+    catch {
+        Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Invoke-AgentBellInformationChime {
+    [System.Media.SystemSounds]::Asterisk.Play()
+}
+
+function Invoke-AgentBellHttpCompletion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][string]$CacheDirectory
+    )
+
+    [System.IO.Directory]::CreateDirectory($CacheDirectory) | Out-Null
+    $wavPath = Join-Path $CacheDirectory ("cached-" + [Guid]::NewGuid().ToString("N") + ".wav")
+    try {
+        if (Request-AgentBellCachedVoice -Message $Message -Config $Config -OutputPath $wavPath) {
+            Invoke-AgentBellWavPlayback -Path $wavPath
+            return "http-cache"
+        }
+    }
+    catch {
+        # A cache or playback error falls through to the immediate local chime.
+    }
+    finally {
+        Remove-Item -LiteralPath $wavPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Invoke-AgentBellInformationChime
+    return "chime"
 }
 
 function Invoke-AgentBellSpeech {
@@ -1072,24 +1298,35 @@ Export-ModuleMember -Function @(
     "Normalize-AgentBellTitle",
     "ConvertTo-AgentBellTitle",
     "Get-AgentBellRolloutThreadSource",
+    "Get-AgentBellRealConversationTitle",
     "Get-AgentBellConversationTitle",
     "Test-AgentBellFailureMessage",
     "Test-AgentBellExplicitFailure",
     "ConvertTo-AgentBellEvent",
     "Get-AgentBellState",
     "Set-AgentBellTurnStart",
+    "Test-AgentBellTurnActive",
+    "Remove-AgentBellTurnStart",
     "Get-AgentBellTurnDurationSeconds",
+    "Get-AgentBellEventDurationSeconds",
     "Get-AgentBellDebounceWaitMilliseconds",
     "Test-AgentBellHandled",
     "Add-AgentBellHandled",
     "Get-AgentBellDecision",
+    "Test-AgentBellShouldPrewarm",
     "Get-AgentBellCompletionAction",
     "Get-AgentBellAnnouncement",
     "New-AgentBellLogRecord",
     "Limit-AgentBellDedupeEntries",
     "Get-AgentBellIdleSeconds",
     "Invoke-AgentBellSapi",
+    "Resolve-AgentBellLoopbackUri",
     "Invoke-AgentBellHttpVoice",
+    "Invoke-AgentBellHttpPrewarm",
+    "Request-AgentBellCachedVoice",
+    "Invoke-AgentBellWavPlayback",
+    "Invoke-AgentBellInformationChime",
+    "Invoke-AgentBellHttpCompletion",
     "Invoke-AgentBellSpeech",
     "Show-AgentBellNotification"
 )

@@ -26,6 +26,12 @@ reference audio, credentials, and other private data before attaching logs.
 - Lite mode uses Windows SAPI and does not require network access.
 - The optional HTTP voice provider must bind to loopback only. Do not expose it
   to a LAN or the public internet.
+- The bundled Voice Pack keeps pre-generated completion audio in a bounded
+  memory-only cache. It must not persist cache text, keys, or WAV data, and the
+  cache must be cleared when the service exits.
+- The Voice Pack runtime updater refuses to terminate a pre-existing listener
+  and replaces only public runtime files. It must not modify the private voice,
+  model, or virtual-environment directories.
 - Hook payloads are treated as untrusted input. Titles and paths must be
   validated before use and must never be interpolated into executable code.
 - Logs omit conversation titles and session IDs by default and must never

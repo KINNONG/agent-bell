@@ -16,7 +16,7 @@ Agent Bell 是非官方开源项目，与 OpenAI 没有隶属或背书关系。
 | 等待确认 | Codex 的 PermissionRequest Hook | 立即语音播报 |
 | 执行遇到问题 | Stop 中最后一条助手消息出现明确失败措辞 | 保守推断后立即语音播报 |
 
-UserPromptSubmit Hook 只记录当前回合的开始时间，不会播报，也不会保存用户提示词。
+UserPromptSubmit Hook 只记录当前回合的开始时间，不会播报，也不会保存用户提示词。启用本地 Voice Pack 时，它还会在独立后台进程中提前准备完成播报，不阻塞 Codex 或主通知队列。
 
 Codex 每日自动化运行默认保持静音，包括完成、失败和等待确认；Agent Bell 根据本地 rollout 的 `thread_source=automation` 判断，不依赖会话名称。手动打开或继续的普通会话仍正常提醒。
 
@@ -40,8 +40,9 @@ Codex Hook
   -> 立即返回，不等待语音
   -> 隐藏的一次性 worker 排队处理
   -> 解析最新会话名并应用去重与播报策略
+  -> 长任务在执行期间提前生成自定义语音
   -> Windows SAPI 或本地 HTTP Voice Pack
-  -> HTTP 失败时回退到 SAPI
+  -> 完成播报缓存未就绪时立即响提示音
 ~~~
 
 插件文件是只读代码。为了让安装脚本与 Hook 始终读取同一份设置，配置、队列、状态、日志和缓存统一位于 `%LOCALAPPDATA%\AgentBell`。可选 Voice Pack 的私人参考音频也应保存在该数据目录，而不是插件源码中。高级用户可以通过 `AGENT_BELL_DATA` 显式覆盖位置。
@@ -61,7 +62,7 @@ Lite 模式不需要 Python、GPU、模型文件或 API Key。
 把下面这句话发给 Codex：
 
 ~~~text
-请安装 https://github.com/KINNONG/agent-bell 的 v0.1.2：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.2 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
+请安装 https://github.com/KINNONG/agent-bell 的 v0.1.3：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.3 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；如果检测到我已经启用旧版 Qwen Voice Pack，核对并关闭它的进程后运行 voice-pack/update.ps1，再重新执行 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
 ~~~
 
 安装过程中有两次必要确认：
@@ -135,15 +136,16 @@ Lite 是公开 v0.1 的默认模式：
 
 ## 可选本地 Qwen Voice Pack
 
-仓库包含一个可选的实验性 [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md)。它使用本地 Qwen3-TTS 0.6B Base 模型，从用户明确授权的参考音频生成自定义音色，并实现下面的通用 HTTP 接口。模型、Python 环境和私人音频不会进入插件仓库；服务失败时仍回退到 SAPI。
+仓库包含一个可选的实验性 [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md)。它使用本地 Qwen3-TTS 0.6B Base 模型，从用户明确授权的参考音频生成自定义音色，并实现下面的本地 HTTP 接口。模型、Python 环境和私人音频不会进入插件仓库。
 
-Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及数 GB 磁盘空间。Lite 模式不需要这些条件。模型会在服务就绪前完成加载；单次合成默认最多等待 30 秒，超时后立即回退到 SAPI。
+Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及数 GB 磁盘空间。Lite 模式不需要这些条件。模型会在服务就绪前完成加载。对于完成事件，Agent Bell 会在任务运行期间提前生成并缓存完整播报；命中缓存时直接播放，缓存尚未准备好的极短任务只立即响一声提示音，不再等待现场合成。权限和失败播报仍使用按需合成，默认最多等待 30 秒后回退到 SAPI。
 
 服务要求：
 
 - 只监听回环地址，不暴露到局域网或公网；客户端会拒绝非回环地址和 HTTP 重定向。
-- 接收 POST JSON，其中包含 text 与 voice_id。
-- 成功时返回 audio/wav。
+- `/synthesize` 接收包含 `text` 与 `voice_id` 的 POST JSON，并按需返回 `audio/wav`。
+- `/prewarm` 立即接受后台预生成请求；`/cached` 只返回已经准备好的 WAV，不会现场生成。
+- 预生成音频使用有界的内存缓存，服务停止后自动清空，不保存到磁盘。
 
 配置示例：
 
@@ -161,7 +163,20 @@ Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及
 }
 ~~~
 
-服务不可用、超时或返回无效 WAV 时，Agent Bell 自动回退到 SAPI。只有在 Voice Pack 已单独安装并通过测试后，才把 provider 改为 http。
+### 从旧版 Voice Pack 升级
+
+`v0.1.3` 的低延迟完成播报需要 Voice Pack 提供 `/prewarm` 与 `/cached`。仅升级插件不会修改插件目录之外的私人 Voice Pack，因此现有用户还需要升级一次本地运行时。
+
+先关闭当前 Voice Pack，确认 `127.0.0.1:17863` 已不再监听，然后从已安装插件根目录运行：
+
+~~~powershell
+$updater = Join-Path $pluginRoot "voice-pack\update.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updater -InstallRoot "D:\AgentBell\voice-pack"
+~~~
+
+使用默认安装目录时可以省略 `-InstallRoot`。更新器不会终止任何预先存在的进程；它只替换 `server.py`、`start.ps1` 和 `requirements.txt`，不接触 `.venv`、模型或私人音色。更新完成后会隐藏启动服务并验证低延迟协议；若更新失败，会尝试恢复并重启旧运行时。
+
+权限或失败播报遇到服务不可用、超时或无效 WAV 时会回退到 SAPI。完成播报的缓存未命中或服务不可用时只播放 Windows 提示音。只有在 Voice Pack 已单独安装并通过测试后，才把 provider 改为 http。
 
 只使用本人拥有或已取得明确授权的参考音频。Agent Bell 不提供公共音色库，也不会在本地模式中主动上传参考音频。
 
@@ -171,7 +186,7 @@ Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及
 - 事件队列只保存处理所需的最小本地元数据，不保存提示词、转录、工具参数或完整助手回答。
 - Stop 的最后一条助手消息只在内存中用于保守失败分类，不写入事件队列。
 - 运行日志默认不记录会话名称和 session ID。
-- 会话名称只在本机解析和播报。启用 HTTP provider 时，最终播报文本会发送到你配置的本地端点。
+- 会话名称只在本机解析和播报。启用 HTTP provider 时，最终播报文本会发送到你配置的本地端点；Voice Pack 预生成缓存只存在于内存中。
 - 若会话名可能包含敏感信息，可从 templates 中移除 {title}。
 - 安装和卸载不会修改 Codex 的 notify 配置，也不会覆盖无关 Hook。
 
@@ -191,7 +206,7 @@ Invoke-Pester .\tests
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex-voice-notifier.ps1 -TestSessionId "00000000-0000-0000-0000-000000000001" -TestTurnId "readme-dry-run" -DryRun
 ~~~
 
-测试覆盖标题清洗、三种话术、smart 边界、保守失败分类、隐私日志、状态裁剪、队列去重、非阻塞 Hook，以及 Voice Pack 的 localhost HTTP 合同。
+测试覆盖标题清洗、三种话术、smart 边界、保守失败分类、隐私日志、状态裁剪、队列去重、非阻塞 Hook、完成语音预生成，以及 Voice Pack 的 localhost HTTP 缓存合同。
 
 ## Doctor
 
@@ -199,7 +214,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex-voice-notifier.p
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup -Action Doctor
 ~~~
 
-Doctor 用于确认 Windows 环境、必要插件文件、三个 Hook 事件、运行配置和用户 hooks.json 是否有效。它不会探测 Hook 信任状态，而会返回打开 /hooks 检查的提示。反馈问题前，可加 -AsJson 获取结构化结果；分享结果前仍应检查并移除私人路径。音频链路应使用 Test 验证。
+Doctor 用于确认 Windows 环境、必要插件文件、三个 Hook 事件、运行配置和用户 hooks.json 是否有效。使用 HTTP Voice Pack 时，它还会通过无重定向、限长、两秒总超时的本地健康检查验证低延迟协议。它不会探测 Hook 信任状态，而会返回打开 /hooks 检查的提示。反馈问题前，可加 -AsJson 获取结构化结果；分享结果前仍应检查并移除私人路径。音频链路应使用 Test 验证。
 
 ## 卸载
 
@@ -228,6 +243,7 @@ UninstallLocalDevelopment 默认保留本地数据。确认不再需要配置、
 - failure 是对明确失败措辞的保守推断。
 - 会话标题来自 Codex 本地状态；读取失败时使用安全回退名称。
 - 自定义音色依赖单独安装并验证的实验性 Qwen localhost 服务，并需要兼容的 NVIDIA GPU。
+- 第一次出现的新会话名称若尚未写入 Codex 本地状态，或任务短于预生成时间，完成时只播放提示音；后续同名播报可复用内存缓存。
 - Agent Bell 不是任务结果验证器，也不替代测试、日志或人工验收。
 
 ## 许可证

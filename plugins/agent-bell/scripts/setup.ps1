@@ -616,6 +616,63 @@ function Invoke-AgentBellSetupTest {
     }
 }
 
+function Get-AgentBellVoicePackHealthPayload {
+    param([Parameter(Mandatory = $true)][Uri]$Uri)
+
+    $maximumResponseBytes = 16KB
+    $timeoutMilliseconds = 2000
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $request = [System.Net.HttpWebRequest]::CreateHttp($Uri)
+    $request.Method = 'GET'
+    $request.Accept = 'application/json'
+    $request.AllowAutoRedirect = $false
+    $request.Proxy = $null
+    $request.Timeout = $timeoutMilliseconds
+    $request.ReadWriteTimeout = $timeoutMilliseconds
+    $response = $null
+    $stream = $null
+    $buffer = New-Object byte[] 4096
+    $body = New-Object System.IO.MemoryStream
+    try {
+        $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        if ([int]$response.StatusCode -ne 200) {
+            throw 'The Voice Pack health endpoint did not return HTTP 200.'
+        }
+        if ($response.ContentLength -gt $maximumResponseBytes) {
+            throw 'The Voice Pack health response is too large.'
+        }
+        $stream = $response.GetResponseStream()
+        while ($true) {
+            $remainingMilliseconds = $timeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+            if ($remainingMilliseconds -le 0) {
+                throw 'The Voice Pack health response exceeded its total deadline.'
+            }
+            if ($stream.CanTimeout) {
+                $stream.ReadTimeout = [Math]::Max(1, $remainingMilliseconds)
+            }
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) {
+                break
+            }
+            if ($body.Length + $read -gt $maximumResponseBytes) {
+                throw 'The Voice Pack health response is too large.'
+            }
+            $body.Write($buffer, 0, $read)
+        }
+        $json = [System.Text.Encoding]::UTF8.GetString($body.ToArray())
+        return ($json | ConvertFrom-Json)
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+        $body.Dispose()
+    }
+}
+
 function Invoke-AgentBellDoctor {
     param([Parameter(Mandatory = $true)][object]$Paths)
 
@@ -631,7 +688,7 @@ function Invoke-AgentBellDoctor {
 
     Add-DoctorCheck -Name 'windows' -Passed ($env:OS -eq 'Windows_NT') -Detail 'Agent Bell v0.1 requires Windows.'
 
-    foreach ($relativePath in @('hooks\hooks.json', 'hooks\enqueue.ps1', 'scripts\AgentBell.Core.psm1', 'scripts\worker.ps1')) {
+    foreach ($relativePath in @('hooks\hooks.json', 'hooks\enqueue.ps1', 'scripts\AgentBell.Core.psm1', 'scripts\worker.ps1', 'scripts\prewarm.ps1', 'voice-pack\update.ps1')) {
         $path = Join-Path $Paths.PluginRoot $relativePath
         Add-DoctorCheck -Name ('plugin:' + $relativePath) -Passed (Test-Path -LiteralPath $path -PathType Leaf) -Detail $path
     }
@@ -648,10 +705,11 @@ function Invoke-AgentBellDoctor {
     }
 
     $configPath = Join-Path $Paths.DataDir 'config.json'
+    $runtimeConfig = $null
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
         try {
             Import-Module (Join-Path $Paths.PluginRoot 'scripts\AgentBell.Core.psm1') -Force -DisableNameChecking
-            $null = Get-AgentBellConfig -Path $configPath
+            $runtimeConfig = Get-AgentBellConfig -Path $configPath
             Add-DoctorCheck -Name 'runtime-config' -Passed $true -Detail $configPath
         }
         catch {
@@ -660,6 +718,41 @@ function Invoke-AgentBellDoctor {
     }
     else {
         Add-DoctorCheck -Name 'runtime-config' -Passed $false -Detail 'Run Initialize to create the local config.'
+    }
+
+    if ($null -ne $runtimeConfig -and [string]$runtimeConfig.voice.provider -eq 'http') {
+        $requiredCapabilities = @('synthesize', 'prewarm', 'cached')
+        try {
+            $healthUri = Resolve-AgentBellLoopbackUri -Endpoint ([string]$runtimeConfig.voice.http.endpoint) -Path '/health'
+            $health = Get-AgentBellVoicePackHealthPayload -Uri $healthUri
+            $protocolVersion = 0
+            if ($null -ne $health.PSObject.Properties['protocol_version']) {
+                $protocolVersion = [int]$health.protocol_version
+            }
+            $capabilities = if ($null -ne $health.PSObject.Properties['capabilities']) {
+                @($health.capabilities | ForEach-Object { [string]$_ })
+            }
+            else {
+                @()
+            }
+            $missingCapabilities = @($requiredCapabilities | Where-Object { $capabilities -notcontains $_ })
+            $compatible = (
+                [string]$health.service -eq 'agent-bell-qwen-voice-pack' -and
+                [string]$health.status -eq 'ready' -and
+                $protocolVersion -ge 1 -and
+                $missingCapabilities.Count -eq 0
+            )
+            $detail = if ($compatible) {
+                "Voice Pack protocol $protocolVersion supports synthesize, prewarm, and cached playback."
+            }
+            else {
+                'The Voice Pack is outdated or incompatible. Stop it, then run voice-pack\update.ps1; the updater restarts it.'
+            }
+            Add-DoctorCheck -Name 'voice-pack-low-latency' -Passed $compatible -Detail $detail
+        }
+        catch {
+            Add-DoctorCheck -Name 'voice-pack-low-latency' -Passed $false -Detail 'The configured Voice Pack is unavailable. Start it, or stop it and run voice-pack\update.ps1.'
+        }
     }
 
     try {

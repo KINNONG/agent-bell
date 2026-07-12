@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
+import queue
 import re
 import socket
 import sys
 import threading
 import time
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +22,8 @@ from urllib.parse import urlsplit
 
 
 SERVICE_NAME = "agent-bell-qwen-voice-pack"
+PROTOCOL_VERSION = 1
+CAPABILITIES = ("synthesize", "prewarm", "cached")
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_REVISION = "5d83992436eae1d760afd27aff78a71d676296fc"
 MODEL_DIRECTORY_NAME = "Qwen3-TTS-12Hz-0.6B-Base"
@@ -36,6 +41,11 @@ MAX_REFERENCE_AUDIO_BYTES = 50 * 1024 * 1024
 MAX_WAV_BYTES = 25 * 1024 * 1024
 MAX_NEW_TOKENS = 1_024
 MAX_VOICES = 16
+MAX_CACHE_ENTRIES = 32
+MAX_CACHE_BYTES = 64 * 1024 * 1024
+CACHE_TTL_SECONDS = 2 * 60 * 60
+CACHE_SWEEP_SECONDS = 60
+MAX_PREWARM_QUEUE_ENTRIES = 8
 
 VOICE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 REFERENCE_AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg")
@@ -51,6 +61,78 @@ class ServiceBusy(Exception):
 
 class ResponseTooLarge(Exception):
     """The generated audio exceeds the response limit."""
+
+
+class WavMemoryCache:
+    """A small process-local WAV cache that never persists synthesis data."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int,
+        max_bytes: int,
+        ttl_seconds: float,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+        self._total_bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> bytes | None:
+        now = self._clock()
+        with self._lock:
+            self._remove_expired(now)
+            entry = self._entries.pop(key, None)
+            if entry is None:
+                return None
+            expires_at, wav_bytes = entry
+            self._entries[key] = (expires_at, wav_bytes)
+            return wav_bytes
+
+    def put(self, key: str, wav_bytes: bytes) -> bool:
+        if not wav_bytes or len(wav_bytes) > self.max_bytes:
+            return False
+
+        now = self._clock()
+        with self._lock:
+            self._remove_expired(now)
+            replaced = self._entries.pop(key, None)
+            if replaced is not None:
+                self._total_bytes -= len(replaced[1])
+            self._entries[key] = (now + self.ttl_seconds, wav_bytes)
+            self._total_bytes += len(wav_bytes)
+            while (
+                len(self._entries) > self.max_entries
+                or self._total_bytes > self.max_bytes
+            ):
+                _oldest_key, (_expires_at, oldest_wav) = self._entries.popitem(
+                    last=False
+                )
+                self._total_bytes -= len(oldest_wav)
+            return key in self._entries
+
+    def prune(self) -> None:
+        with self._lock:
+            self._remove_expired(self._clock())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._total_bytes = 0
+
+    def _remove_expired(self, now: float) -> None:
+        expired = [
+            key
+            for key, (expires_at, _wav_bytes) in self._entries.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            _expires_at, wav_bytes = self._entries.pop(key)
+            self._total_bytes -= len(wav_bytes)
 
 
 def configure_local_environment(install_root: Path, *, offline: bool) -> None:
@@ -187,6 +269,7 @@ class VoiceService:
         self._prompts = self._load_voice_prompts()
         if not self._prompts:
             raise RuntimeError("No valid local voice is configured.")
+        self._initialize_prewarm()
 
     @property
     def voice_ids(self) -> tuple[str, ...]:
@@ -237,37 +320,158 @@ class VoiceService:
                 )
         return prompts
 
+    def _initialize_prewarm(self) -> None:
+        self._cache = WavMemoryCache(
+            max_entries=MAX_CACHE_ENTRIES,
+            max_bytes=MAX_CACHE_BYTES,
+            ttl_seconds=CACHE_TTL_SECONDS,
+        )
+        self._prewarm_queue: queue.Queue[tuple[str, str, str] | None] = queue.Queue(
+            maxsize=MAX_PREWARM_QUEUE_ENTRIES
+        )
+        self._pending_prewarm: set[str] = set()
+        self._pending_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._prewarm_thread = threading.Thread(
+            target=self._run_prewarm,
+            name="AgentBellVoicePrewarm",
+            daemon=True,
+        )
+        self._prewarm_thread.start()
+
+    @staticmethod
+    def _cache_key(text: str, voice_id: str) -> str:
+        material = (voice_id + "\0" + text).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
+    def get_cached(self, text: str, voice_id: str) -> bytes | None:
+        if voice_id not in self._prompts:
+            raise KeyError(voice_id)
+        if self._closing.is_set():
+            raise ServiceBusy
+        return self._cache.get(self._cache_key(text, voice_id))
+
+    def prewarm(self, text: str, voice_id: str) -> str:
+        if voice_id not in self._prompts:
+            raise KeyError(voice_id)
+        key = self._cache_key(text, voice_id)
+
+        with self._pending_lock:
+            if self._closing.is_set():
+                raise ServiceBusy
+            if self._cache.get(key) is not None:
+                return "cached"
+            if key in self._pending_prewarm:
+                return "pending"
+            try:
+                self._prewarm_queue.put_nowait((key, text, voice_id))
+            except queue.Full as exc:
+                raise ServiceBusy from exc
+            self._pending_prewarm.add(key)
+        return "accepted"
+
+    def _run_prewarm(self) -> None:
+        while True:
+            try:
+                item = self._prewarm_queue.get(timeout=CACHE_SWEEP_SECONDS)
+            except queue.Empty:
+                self._cache.prune()
+                if self._closing.is_set():
+                    return
+                continue
+            if item is None:
+                self._prewarm_queue.task_done()
+                return
+            key, text, voice_id = item
+            try:
+                self._synthesize_with_lock(text, voice_id, blocking=True)
+            except Exception as exc:  # Never expose synthesis text in diagnostics.
+                print(
+                    f"[agent-bell-voice-pack] prewarm failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                with self._pending_lock:
+                    self._pending_prewarm.discard(key)
+                self._prewarm_queue.task_done()
+                # Do not retain the previous announcement while the worker is idle.
+                item = None
+                key = text = voice_id = ""
+
+    def close(self) -> None:
+        with self._pending_lock:
+            self._closing.set()
+            while True:
+                try:
+                    discarded = self._prewarm_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._prewarm_queue.task_done()
+                discarded = None
+            self._pending_prewarm.clear()
+            self._prewarm_queue.put_nowait(None)
+
+        # Model generation cannot be cancelled safely. Wait for any in-flight
+        # request, then clear all announcement audio before returning.
+        self._prewarm_thread.join()
+        self.generation_lock.acquire()
+        try:
+            self._cache.clear()
+        finally:
+            self.generation_lock.release()
+
     def synthesize(self, text: str, voice_id: str) -> bytes:
+        return self._synthesize_with_lock(text, voice_id, blocking=False)
+
+    def _synthesize_with_lock(
+        self, text: str, voice_id: str, *, blocking: bool
+    ) -> bytes:
         prompt = self._prompts.get(voice_id)
         if prompt is None:
             raise KeyError(voice_id)
-        if not self.generation_lock.acquire(blocking=False):
+        if self._closing.is_set():
+            raise ServiceBusy
+        key = self._cache_key(text, voice_id)
+        wav_bytes = self._cache.get(key)
+        if wav_bytes is not None:
+            return wav_bytes
+        if not self.generation_lock.acquire(blocking=blocking):
             raise ServiceBusy
 
         try:
-            with self._torch.inference_mode():
-                waveforms, sample_rate = self._model.generate_voice_clone(
-                    text=text,
-                    language="Auto",
-                    voice_clone_prompt=prompt,
-                    non_streaming_mode=True,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                )
-            if len(waveforms) != 1 or int(sample_rate) <= 0:
-                raise RuntimeError("The model returned an invalid audio result.")
-
-            import soundfile as sf
-
-            output = io.BytesIO()
-            sf.write(output, waveforms[0], int(sample_rate), format="WAV", subtype="PCM_16")
-            wav_bytes = output.getvalue()
-            if len(wav_bytes) < 44:
-                raise RuntimeError("The model returned an empty WAV payload.")
-            if len(wav_bytes) > MAX_WAV_BYTES:
-                raise ResponseTooLarge
+            if self._closing.is_set():
+                raise ServiceBusy
+            wav_bytes = self._cache.get(key)
+            if wav_bytes is None:
+                wav_bytes = self._generate_uncached(text, prompt)
+                self._cache.put(key, wav_bytes)
             return wav_bytes
         finally:
             self.generation_lock.release()
+
+    def _generate_uncached(self, text: str, prompt: Any) -> bytes:
+        with self._torch.inference_mode():
+            waveforms, sample_rate = self._model.generate_voice_clone(
+                text=text,
+                language="Auto",
+                voice_clone_prompt=prompt,
+                non_streaming_mode=True,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+        if len(waveforms) != 1 or int(sample_rate) <= 0:
+            raise RuntimeError("The model returned an invalid audio result.")
+
+        import soundfile as sf
+
+        output = io.BytesIO()
+        sf.write(output, waveforms[0], int(sample_rate), format="WAV", subtype="PCM_16")
+        wav_bytes = output.getvalue()
+        if len(wav_bytes) < 44:
+            raise RuntimeError("The model returned an empty WAV payload.")
+        if len(wav_bytes) > MAX_WAV_BYTES:
+            raise ResponseTooLarge
+        return wav_bytes
 
 
 class VoiceRequestHandler(BaseHTTPRequestHandler):
@@ -310,6 +514,8 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             {
                 "service": SERVICE_NAME,
                 "status": "ready",
+                "protocol_version": PROTOCOL_VERSION,
+                "capabilities": list(CAPABILITIES),
                 "model": MODEL_ID,
                 "model_revision": MODEL_REVISION,
                 "voices": list(self.service.voice_ids),
@@ -318,13 +524,30 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         target = urlsplit(self.path)
-        if target.path != "/synthesize" or target.query or target.fragment:
+        if (
+            target.path not in ("/synthesize", "/prewarm", "/cached")
+            or target.query
+            or target.fragment
+        ):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
 
         try:
             text, voice_id = self._read_synthesis_request()
-            wav_bytes = self.service.synthesize(text, voice_id)
+            if target.path == "/prewarm":
+                status = self.service.prewarm(text, voice_id)
+                response_status = (
+                    HTTPStatus.OK if status == "cached" else HTTPStatus.ACCEPTED
+                )
+                self._send_json(response_status, {"status": status})
+                return
+            if target.path == "/cached":
+                wav_bytes = self.service.get_cached(text, voice_id)
+                if wav_bytes is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "cache_miss"})
+                    return
+            else:
+                wav_bytes = self.service.synthesize(text, voice_id)
         except RequestRejected:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
@@ -339,7 +562,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             return
         except Exception as exc:  # Keep model errors and private text out of responses and logs.
             print(
-                f"[agent-bell-voice-pack] synthesis failed ({type(exc).__name__})",
+                f"[agent-bell-voice-pack] request failed ({type(exc).__name__})",
                 file=sys.stderr,
                 flush=True,
             )
@@ -413,6 +636,7 @@ class LocalVoiceHTTPServer(ThreadingHTTPServer):
 
 def serve(install_root: Path, requested_model: str | None = None) -> None:
     server = LocalVoiceHTTPServer((BIND_HOST, PORT), VoiceRequestHandler)
+    service: VoiceService | None = None
     actual_host, actual_port = server.server_address[:2]
     if actual_host != BIND_HOST or actual_port != PORT:
         server.server_close()
@@ -433,6 +657,8 @@ def serve(install_root: Path, requested_model: str | None = None) -> None:
         pass
     finally:
         server.server_close()
+        if service is not None:
+            service.close()
 
 
 def parse_args() -> argparse.Namespace:

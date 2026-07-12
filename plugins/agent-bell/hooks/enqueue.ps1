@@ -102,7 +102,8 @@ try {
             "-ExecutionPolicy", "Bypass",
             "-File", ('"' + $workerPath + '"'),
             "-DataDir", ('"' + $DataDir + '"'),
-            "-PluginRoot", ('"' + $PluginRoot + '"')
+            "-PluginRoot", ('"' + $PluginRoot + '"'),
+            "-CodexHome", ('"' + $CodexHome + '"')
         )
         if ($WorkerDryRun.IsPresent) {
             $workerArguments += "-DryRun"

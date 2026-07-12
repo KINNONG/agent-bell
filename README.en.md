@@ -16,7 +16,7 @@ Agent Bell is an unofficial open-source project. It is not affiliated with or en
 | Permission required | Codex PermissionRequest hook | Speak immediately |
 | Execution problem | Explicit failure wording in the final Stop message | Conservatively infer failure and speak immediately |
 
-The UserPromptSubmit hook records only the start time of the turn. It does not speak or persist the user prompt.
+The UserPromptSubmit hook records only the start time of the turn. It does not speak or persist the user prompt. With the local Voice Pack enabled, it also prepares completion audio in a separate background process without blocking Codex or the main notification queue.
 
 Scheduled Codex automation runs are silent by default, including completion, failure, and permission events. Agent Bell uses the local rollout's `thread_source=automation` metadata rather than guessing from the title. Normal user-started or resumed threads still notify.
 
@@ -40,8 +40,9 @@ Codex hook
   -> return immediately without waiting for speech
   -> hidden one-shot worker drains the queue
   -> resolve the latest title, deduplicate, and apply the notification policy
+  -> pre-generate custom completion audio while long tasks run
   -> Windows SAPI or a localhost HTTP Voice Pack
-  -> fall back to SAPI when HTTP synthesis fails
+  -> play one prompt sound when completion audio is not ready
 ~~~
 
 Plugin files contain read-only code. To ensure setup commands and hooks always read the same settings, configuration, queue files, state, logs, and cache live under `%LOCALAPPDATA%\AgentBell`. Private reference audio for an optional Voice Pack should also stay there, never in plugin source. Advanced users may override the location with `AGENT_BELL_DATA`.
@@ -61,7 +62,7 @@ Lite mode does not require Python, a GPU, model files, or an API key.
 Send this sentence to Codex:
 
 ~~~text
-Install Agent Bell v0.1.2 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.2 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
+Install Agent Bell v0.1.3 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.3 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. If an older Qwen Voice Pack is enabled, verify and stop its process, run voice-pack/update.ps1, and run Doctor again. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
 ~~~
 
 There are two intentional confirmations:
@@ -135,15 +136,16 @@ The default `always` mode speaks every Complete event. To reduce interruptions f
 
 ## Optional Local Qwen Voice Pack
 
-The repository includes an optional experimental [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md). It uses the local Qwen3-TTS 0.6B Base model to create a custom voice from user-authorized reference audio and implements the generic HTTP contract below. Model weights, the Python environment, and private audio stay outside the plugin repository; failures still fall back to SAPI.
+The repository includes an optional experimental [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md). It uses the local Qwen3-TTS 0.6B Base model to create a custom voice from user-authorized reference audio and implements the localhost HTTP contract below. Model weights, the Python environment, and private audio stay outside the plugin repository.
 
-The Voice Pack requires Python 3.12, an NVIDIA GPU with CUDA and bfloat16 support, and several gigabytes of disk space. Lite mode requires none of these. The model loads before the service reports ready; each synthesis waits up to 30 seconds before falling back to SAPI.
+The Voice Pack requires Python 3.12, an NVIDIA GPU with CUDA and bfloat16 support, and several gigabytes of disk space. Lite mode requires none of these. For completion events, Agent Bell prepares the exact announcement while the task runs and plays it from cache. A very short task whose cache is not ready plays one prompt sound instead of waiting for synthesis. Permission and failure announcements still use on-demand synthesis with a 30-second timeout and SAPI fallback.
 
 The service must:
 
 - Bind only to a loopback address, not a LAN or public interface. The client rejects non-loopback endpoints and HTTP redirects.
-- Accept POST JSON containing text and voice_id.
-- Return audio/wav on success.
+- `/synthesize` accepts POST JSON containing `text` and `voice_id` and generates `audio/wav` on demand.
+- `/prewarm` accepts a background preparation request immediately; `/cached` returns only an already prepared WAV and never generates on demand.
+- Prepared audio uses a bounded memory-only cache that is cleared when the service stops.
 
 Example configuration:
 
@@ -161,7 +163,20 @@ Example configuration:
 }
 ~~~
 
-Agent Bell falls back to SAPI if the service is unavailable, times out, or returns an invalid WAV. Change provider to http only after the Voice Pack has been installed separately and passed a local test.
+### Upgrading an Existing Voice Pack
+
+The `v0.1.3` low-latency completion path requires `/prewarm` and `/cached`. A plugin upgrade cannot modify a private Voice Pack installed outside the plugin directory, so existing users must update that local runtime once.
+
+Stop the current Voice Pack and confirm that `127.0.0.1:17863` is no longer listening, then run this from the installed plugin root:
+
+~~~powershell
+$updater = Join-Path $pluginRoot "voice-pack\update.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updater -InstallRoot "D:\AgentBell\voice-pack"
+~~~
+
+Omit `-InstallRoot` for the default location. The updater never terminates a pre-existing process. It replaces only `server.py`, `start.ps1`, and `requirements.txt`; it does not touch `.venv`, models, or private voices. It starts the service hidden and verifies the low-latency protocol, and attempts to restore and restart the previous runtime if the update fails.
+
+Permission and failure announcements fall back to SAPI if the service is unavailable, times out, or returns an invalid WAV. A completion cache miss or unavailable service plays one Windows prompt sound. Change provider to http only after the Voice Pack has been installed separately and passed a local test.
 
 Use only reference audio that you own or have explicit permission to use. Agent Bell provides no public voice library and does not upload reference audio in local mode.
 
@@ -171,7 +186,7 @@ Use only reference audio that you own or have explicit permission to use. Agent 
 - Queue files contain only the minimum local metadata needed for processing. They do not persist prompts, transcripts, tool arguments, or full assistant responses.
 - The final Stop message is examined in memory for conservative failure classification and is not written to the queue.
 - Operational logs omit conversation titles and session IDs by default.
-- Titles are resolved and spoken locally. With an HTTP provider, the final announcement text is sent to the configured local endpoint.
+- Titles are resolved and spoken locally. With an HTTP provider, the final announcement text is sent to the configured local endpoint; the Voice Pack preparation cache exists only in memory.
 - Remove {title} from the templates when conversation names may be sensitive.
 - Setup and uninstall preserve Codex notify configuration and unrelated hooks.
 
@@ -191,7 +206,7 @@ Run a silent dry run through the compatibility entry point:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex-voice-notifier.ps1 -TestSessionId "00000000-0000-0000-0000-000000000001" -TestTurnId "readme-dry-run" -DryRun
 ~~~
 
-The suite covers title sanitization, all three templates, smart boundaries, conservative failure classification, privacy-safe logs, state pruning, queue deduplication, non-blocking hook behavior, and the Voice Pack localhost HTTP contract.
+The suite covers title sanitization, all three templates, smart boundaries, conservative failure classification, privacy-safe logs, state pruning, queue deduplication, non-blocking hook behavior, completion prewarming, and the Voice Pack localhost HTTP cache contract.
 
 ## Doctor
 
@@ -199,7 +214,7 @@ The suite covers title sanitization, all three templates, smart boundaries, cons
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup -Action Doctor
 ~~~
 
-Doctor checks Windows, required plugin files, all three hook events, runtime config, and the user hooks.json. It does not infer hook trust; instead, it returns an instruction to review /hooks. Add -AsJson for structured output, and still review it for private local paths before sharing it. Use Test to verify the audio path.
+Doctor checks Windows, required plugin files, all three hook events, runtime config, and the user hooks.json. When an HTTP Voice Pack is configured, it also verifies the low-latency protocol through a no-redirect, size-bounded health probe with a true two-second deadline. It does not infer hook trust; instead, it returns an instruction to review /hooks. Add -AsJson for structured output, and still review it for private local paths before sharing it. Use Test to verify the audio path.
 
 ## Uninstall
 
@@ -228,6 +243,7 @@ Do not run EnableLocalDevelopment for a normal marketplace installation. Source 
 - Failure is conservatively inferred from explicit wording.
 - Titles come from local Codex state and use a safe fallback when unavailable.
 - Custom voices require a separately installed and verified experimental Qwen localhost service and a compatible NVIDIA GPU.
+- A new title that is not yet present in Codex state, or a task shorter than the preparation time, produces one prompt sound on its first completion; later announcements with the same title can reuse the memory cache.
 - Agent Bell is not a task-result verifier and does not replace tests, logs, or human review.
 
 ## License

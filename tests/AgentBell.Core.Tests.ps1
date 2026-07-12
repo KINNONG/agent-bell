@@ -90,6 +90,24 @@ Describe 'Agent Bell title handling' {
 
         $actual | Should Be 'Agent Bell 开源版'
     }
+
+    It 'distinguishes a real Codex title from cwd and generic fallbacks' {
+        $sessionIndexPath = Join-Path $TestDrive 'empty-session-index.jsonl'
+        [System.IO.File]::WriteAllText($sessionIndexPath, '', (New-Object System.Text.UTF8Encoding($false)))
+
+        $realTitle = Get-AgentBellRealConversationTitle `
+            -SessionId '12121212-1212-1212-1212-121212121212' `
+            -SessionIndexPath $sessionIndexPath `
+            -MaxLength 48
+        $fallbackTitle = Get-AgentBellConversationTitle `
+            -SessionId '12121212-1212-1212-1212-121212121212' `
+            -SessionIndexPath $sessionIndexPath `
+            -Cwd 'C:\work\fallback-project' `
+            -MaxLength 48
+
+        [string]::IsNullOrWhiteSpace([string]$realTitle) | Should Be $true
+        $fallbackTitle | Should Be 'fallback-project'
+    }
 }
 
 Describe 'Agent Bell Codex thread source detection' {
@@ -220,7 +238,7 @@ Describe 'Agent Bell conservative failure classification' {
 }
 
 Describe 'Agent Bell Stop continuation handling' {
-    It 'keeps initial and continued Stop candidates in separate dedupe slots' {
+    It 'shares one dedupe slot across initial and continued Stop outcomes for the same turn' {
         $base = [ordered]@{
             hook_event_name = 'Stop'
             session_id = '77777777-7777-7777-7777-777777777777'
@@ -231,11 +249,17 @@ Describe 'Agent Bell Stop continuation handling' {
         $base.stop_hook_active = $false
         $initial = ConvertTo-AgentBellEvent -Payload ([pscustomobject]$base)
         $base.stop_hook_active = $true
+        $base.last_assistant_message = 'Task failed: final continuation failed.'
         $continued = ConvertTo-AgentBellEvent -Payload ([pscustomobject]$base)
+        $base.turn_id = 'another-turn'
+        $differentTurn = ConvertTo-AgentBellEvent -Payload ([pscustomobject]$base)
 
         $initial.stop_hook_active | Should Be $false
         $continued.stop_hook_active | Should Be $true
-        $initial.dedupe_key | Should Not Be $continued.dedupe_key
+        $initial.kind | Should Be 'complete'
+        $continued.kind | Should Be 'failure'
+        $initial.dedupe_key | Should Be $continued.dedupe_key
+        $initial.dedupe_key | Should Not Be $differentTurn.dedupe_key
     }
 }
 
@@ -248,6 +272,62 @@ Describe 'Agent Bell debounce timing' {
             Should Be 2000
         Get-AgentBellDebounceWaitMilliseconds -CapturedAt 'invalid' -DebounceSeconds 5 -Now $now |
             Should Be 5000
+    }
+}
+
+Describe 'Agent Bell active turn lifecycle' {
+    It 'removes only the completed turn from state' {
+        $state = Get-AgentBellState
+        $state = Set-AgentBellTurnStart -State $state -Key 'session-a|turn-a' -CapturedAt '2026-07-12T12:00:00Z'
+        $state = Set-AgentBellTurnStart -State $state -Key 'session-b|turn-b' -CapturedAt '2026-07-12T12:00:01Z'
+
+        Test-AgentBellTurnActive -State $state -Key 'session-a|turn-a' | Should Be $true
+        $state = Remove-AgentBellTurnStart -State $state -Key 'session-a|turn-a'
+
+        Test-AgentBellTurnActive -State $state -Key 'session-a|turn-a' | Should Be $false
+        Test-AgentBellTurnActive -State $state -Key 'session-b|turn-b' | Should Be $true
+    }
+
+    It 'persists a Stop duration so a retry does not depend on removed turn state' {
+        $state = Get-AgentBellState
+        $state = Set-AgentBellTurnStart -State $state -Key 'session-a|turn-a' -CapturedAt '2026-07-12T12:00:00Z'
+        $event = [pscustomobject]@{ captured_at = '2026-07-12T12:00:15Z' }
+
+        $firstDuration = Get-AgentBellEventDurationSeconds `
+            -Event $event `
+            -State $state `
+            -Key 'session-a|turn-a' `
+            -StoppedAt ([string]$event.captured_at)
+        $state = Remove-AgentBellTurnStart -State $state -Key 'session-a|turn-a'
+        $retriedEvent = ($event | ConvertTo-Json -Compress) | ConvertFrom-Json
+        $retryDuration = Get-AgentBellEventDurationSeconds `
+            -Event $retriedEvent `
+            -State $state `
+            -Key 'session-a|turn-a' `
+            -StoppedAt ([string]$retriedEvent.captured_at)
+
+        $firstDuration | Should Be 15
+        $retryDuration | Should Be 15
+        $retriedEvent.duration_seconds | Should Be 15
+    }
+}
+
+Describe 'Agent Bell prewarm policy' {
+    It 'allows only live non-automation HTTP prompt starts outside dry-run mode' {
+        $config = Get-AgentBellDefaultConfig
+        $config.voice.provider = 'http'
+        $userStart = [pscustomobject]@{ kind = 'start'; thread_source = 'user' }
+        $automationStart = [pscustomobject]@{ kind = 'start'; thread_source = 'automation' }
+
+        Test-AgentBellShouldPrewarm -Event $userStart -Config $config -DryRun $false | Should Be $true
+        Test-AgentBellShouldPrewarm -Event $automationStart -Config $config -DryRun $false | Should Be $false
+        Test-AgentBellShouldPrewarm -Event $userStart -Config $config -DryRun $true | Should Be $false
+
+        $config.notifications.automation_runs = 'normal'
+        Test-AgentBellShouldPrewarm -Event $automationStart -Config $config -DryRun $false | Should Be $true
+
+        $config.voice.provider = 'sapi'
+        Test-AgentBellShouldPrewarm -Event $userStart -Config $config -DryRun $false | Should Be $false
     }
 }
 
@@ -288,6 +368,18 @@ Describe 'Agent Bell local voice boundary' {
             Should Throw
 
         (Test-Path -LiteralPath $outputPath) | Should Be $false
+    }
+
+    It 'derives only loopback sibling endpoints for cache operations' {
+        $cached = Resolve-AgentBellLoopbackUri `
+            -Endpoint 'http://127.0.0.1:17863/synthesize' `
+            -Path '/cached'
+
+        $cached.AbsoluteUri | Should Be 'http://127.0.0.1:17863/cached'
+        { Resolve-AgentBellLoopbackUri -Endpoint 'http://127.0.0.1.example.com/synthesize' -Path '/prewarm' } |
+            Should Throw
+        { Resolve-AgentBellLoopbackUri -Endpoint 'http://user@127.0.0.1:17863/synthesize' -Path '/prewarm' } |
+            Should Throw
     }
 }
 

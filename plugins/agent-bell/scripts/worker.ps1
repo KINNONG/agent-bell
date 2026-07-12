@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$DataDir,
     [Parameter(Mandatory = $true)][string]$PluginRoot,
+    [string]$CodexHome,
     [switch]$DryRun
 )
 
@@ -14,10 +15,18 @@ Import-Module $modulePath -Force -DisableNameChecking
 $pendingDirectory = Join-Path $DataDir "queue\pending"
 $processingDirectory = Join-Path $DataDir "queue\processing"
 $failedDirectory = Join-Path $DataDir "queue\failed"
+$prewarmDirectory = Join-Path $DataDir "queue\prewarm"
 $statePath = Join-Path $DataDir "state\state.json"
 $configPath = Join-Path $DataDir "config.json"
 $logPath = Join-Path $DataDir "logs\agent-bell.jsonl"
 $cacheDirectory = Join-Path $DataDir "cache"
+$prewarmCandidates = @()
+$config = $null
+$state = $null
+
+if ([string]::IsNullOrWhiteSpace($CodexHome)) {
+    $CodexHome = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+}
 
 function Remove-AgentBellStaleQueueFiles {
     param(
@@ -34,31 +43,38 @@ function Remove-AgentBellStaleQueueFiles {
     }
 }
 
-function Test-AgentBellLaterSessionActivity {
+function Get-AgentBellLaterSessionActivity {
     param(
         [string]$PendingDirectory,
         [string]$SessionId,
         [DateTimeOffset]$CapturedAt,
-        [string]$CurrentDedupeKey
+        [string]$TurnId,
+        [switch]$SameTurnOnly
     )
 
+    $earliestAt = $null
+    $activity = $null
     foreach ($file in @(Get-ChildItem -LiteralPath $PendingDirectory -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
         try {
             $candidate = [System.IO.File]::ReadAllText($file.FullName, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json
+            $candidateAt = [DateTimeOffset]::Parse([string]$candidate.captured_at)
+            $sameTurn = [string]$candidate.turn_id -eq $TurnId
             if ([string]$candidate.session_id -eq $SessionId -and
-                [string]$candidate.dedupe_key -ne $CurrentDedupeKey -and
-                [DateTimeOffset]::Parse([string]$candidate.captured_at) -gt $CapturedAt) {
-                return $true
+                (-not $SameTurnOnly.IsPresent -or $sameTurn) -and
+                $candidateAt -gt $CapturedAt -and
+                ($null -eq $earliestAt -or $candidateAt -lt $earliestAt)) {
+                $earliestAt = $candidateAt
+                $activity = if ($sameTurn) { "same-turn" } else { "different-turn" }
             }
         }
         catch {
             # The normal queue pass will quarantine malformed events.
         }
     }
-    return $false
+    return $activity
 }
 
-foreach ($directory in @($pendingDirectory, $processingDirectory, $failedDirectory, (Split-Path -Parent $statePath), (Split-Path -Parent $logPath), $cacheDirectory)) {
+foreach ($directory in @($pendingDirectory, $processingDirectory, $failedDirectory, $prewarmDirectory, (Split-Path -Parent $statePath), (Split-Path -Parent $logPath), $cacheDirectory)) {
     [System.IO.Directory]::CreateDirectory($directory) | Out-Null
 }
 
@@ -92,6 +108,7 @@ try {
     $queueCutoff = [DateTime]::UtcNow.AddHours(-1 * [int]$config.limits.queue_ttl_hours)
     Remove-AgentBellStaleQueueFiles -Directory $pendingDirectory -MaxEntries ([int]$config.limits.queue_entries) -Cutoff $queueCutoff
     Remove-AgentBellStaleQueueFiles -Directory $failedDirectory -MaxEntries ([int]$config.limits.failed_entries) -Cutoff $queueCutoff
+    Remove-AgentBellStaleQueueFiles -Directory $prewarmDirectory -MaxEntries ([int]$config.limits.queue_entries) -Cutoff $queueCutoff
 
     $emptyChecks = 0
 
@@ -115,8 +132,24 @@ try {
                 if ([string]$event.kind -eq "start") {
                     $state = Set-AgentBellTurnStart -State $state -Key $turnKey -CapturedAt ([string]$event.captured_at) -MaxEntries ([int]$config.limits.state_entries)
                     Write-AgentBellJsonAtomic -Path $statePath -Value $state
+                    if (Test-AgentBellShouldPrewarm -Event $event -Config $config -DryRun $DryRun.IsPresent) {
+                        $prewarmCandidates += [pscustomobject]@{
+                            key = $turnKey
+                            session_id = [string]$event.session_id
+                            turn_id = [string]$event.turn_id
+                            thread_source = if ($null -ne $event.PSObject.Properties['thread_source']) { [string]$event.thread_source } else { 'unknown' }
+                        }
+                    }
                     Remove-Item -LiteralPath $processingPath -Force
                     continue
+                }
+
+                if ([string]$event.event -eq "Stop") {
+                    $duration = Get-AgentBellEventDurationSeconds -Event $event -State $state -Key $turnKey -StoppedAt ([string]$event.captured_at)
+                    Write-AgentBellJsonAtomic -Path $processingPath -Value $event
+                }
+                else {
+                    $duration = Get-AgentBellTurnDurationSeconds -State $state -Key $turnKey -StoppedAt ([string]$event.captured_at)
                 }
 
                 if (Test-AgentBellHandled -State $state -Key ([string]$event.dedupe_key)) {
@@ -128,6 +161,9 @@ try {
                 $threadSourceProperty = $event.PSObject.Properties["thread_source"]
                 $threadSource = if ($null -ne $threadSourceProperty) { [string]$threadSourceProperty.Value } else { "unknown" }
                 if ([string]$config.notifications.automation_runs -eq "none" -and $threadSource -eq "automation") {
+                    if ([string]$event.event -eq "Stop") {
+                        $state = Remove-AgentBellTurnStart -State $state -Key $turnKey
+                    }
                     $state = Add-AgentBellHandled -State $state -Key ([string]$event.dedupe_key) -MaxEntries ([int]$config.limits.state_entries)
                     Write-AgentBellJsonAtomic -Path $statePath -Value $state
                     Write-AgentBellLog -Path $logPath -Level "info" -Message "Suppressed an automation event." -Data @{
@@ -148,18 +184,32 @@ try {
                         if ($waitMilliseconds -gt 0) {
                             Start-Sleep -Milliseconds $waitMilliseconds
                         }
-                        $capturedAt = [DateTimeOffset]::Parse([string]$event.captured_at)
-                        if (Test-AgentBellLaterSessionActivity -PendingDirectory $pendingDirectory -SessionId ([string]$event.session_id) -CapturedAt $capturedAt -CurrentDedupeKey ([string]$event.dedupe_key)) {
-                            Write-AgentBellLog -Path $logPath -Level "info" -Message "Suppressed a Stop candidate after later session activity." -Data @{ event = [string]$event.kind; decision = "suppressed" } -MaxBytes ([int]$config.limits.log_bytes)
-                            Remove-Item -LiteralPath $processingPath -Force
-                            continue
+                    }
+                    $capturedAt = [DateTimeOffset]::Parse([string]$event.captured_at)
+                    $laterActivity = Get-AgentBellLaterSessionActivity `
+                        -PendingDirectory $pendingDirectory `
+                        -SessionId ([string]$event.session_id) `
+                        -CapturedAt $capturedAt `
+                        -TurnId ([string]$event.turn_id) `
+                        -SameTurnOnly:($debounceSeconds -le 0)
+                    if ($null -ne $laterActivity) {
+                        if ($laterActivity -eq "different-turn") {
+                            $state = Remove-AgentBellTurnStart -State $state -Key $turnKey
+                            $state = Add-AgentBellHandled -State $state -Key ([string]$event.dedupe_key) -MaxEntries ([int]$config.limits.state_entries)
+                            Write-AgentBellJsonAtomic -Path $statePath -Value $state
                         }
+                        Write-AgentBellLog -Path $logPath -Level "info" -Message "Suppressed a Stop candidate after later session activity." -Data @{ event = [string]$event.kind; decision = "suppressed" } -MaxBytes ([int]$config.limits.log_bytes)
+                        Remove-Item -LiteralPath $processingPath -Force
+                        continue
                     }
                 }
 
-                $codexHome = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-                $title = Get-AgentBellConversationTitle -CodexHome $codexHome -SessionId ([string]$event.session_id) -Cwd ([string]$event.cwd) -MaxCharacters ([int]$config.max_title_characters)
-                $duration = Get-AgentBellTurnDurationSeconds -State $state -Key $turnKey -StoppedAt ([string]$event.captured_at)
+                if ([string]$event.event -eq "Stop") {
+                    $state = Remove-AgentBellTurnStart -State $state -Key $turnKey
+                    Write-AgentBellJsonAtomic -Path $statePath -Value $state
+                }
+
+                $title = Get-AgentBellConversationTitle -CodexHome $CodexHome -SessionId ([string]$event.session_id) -Cwd ([string]$event.cwd) -MaxCharacters ([int]$config.max_title_characters)
                 $idleSeconds = try { Get-AgentBellIdleSeconds } catch { 0 }
                 $decision = Get-AgentBellDecision -Kind ([string]$event.kind) -DurationSeconds $duration -IdleSeconds $idleSeconds -Config $config
                 $announcement = Get-AgentBellAnnouncement -Kind ([string]$event.kind) -Title $title -Config $config
@@ -167,7 +217,12 @@ try {
                 $provider = "none"
                 if (-not $DryRun.IsPresent) {
                     if ($decision -eq "speak") {
-                        $provider = Invoke-AgentBellSpeech -Message $announcement -Config $config -CacheDirectory $cacheDirectory
+                        if ([string]$event.kind -eq "complete" -and [string]$config.voice.provider -eq "http") {
+                            $provider = Invoke-AgentBellHttpCompletion -Message $announcement -Config $config -CacheDirectory $cacheDirectory
+                        }
+                        else {
+                            $provider = Invoke-AgentBellSpeech -Message $announcement -Config $config -CacheDirectory $cacheDirectory
+                        }
                     }
                     elseif ($decision -eq "notify" -and [string]$config.notifications.short_active_turn -eq "toast") {
                         Show-AgentBellNotification -Title "Agent Bell" -Message $announcement
@@ -227,6 +282,46 @@ finally {
         $mutex.ReleaseMutex()
     }
     $mutex.Dispose()
+}
+
+if ($null -ne $config -and $null -ne $state -and $prewarmCandidates.Count -gt 0) {
+    $prewarmScript = Join-Path $PluginRoot "scripts\prewarm.ps1"
+    $launched = @{}
+    foreach ($candidate in $prewarmCandidates) {
+        if ($launched.ContainsKey([string]$candidate.key) -or -not (Test-AgentBellTurnActive -State $state -Key ([string]$candidate.key))) {
+            continue
+        }
+        $launched[[string]$candidate.key] = $true
+        [System.IO.Directory]::CreateDirectory($prewarmDirectory) | Out-Null
+        $requestPath = Join-Path $prewarmDirectory ("prewarm-" + [Guid]::NewGuid().ToString("N") + ".json")
+        $request = [pscustomobject][ordered]@{
+            schema_version = 1
+            session_id = [string]$candidate.session_id
+            turn_id = [string]$candidate.turn_id
+            thread_source = [string]$candidate.thread_source
+        }
+        try {
+            Write-AgentBellJsonAtomic -Path $requestPath -Value $request
+            $arguments = @(
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy", "Bypass",
+                "-File", ('"' + $prewarmScript + '"'),
+                "-PluginRoot", ('"' + $PluginRoot + '"'),
+                "-DataDir", ('"' + $DataDir + '"'),
+                "-CodexHome", ('"' + $CodexHome + '"'),
+                "-RequestPath", ('"' + $requestPath + '"')
+            )
+            Start-Process -FilePath "powershell.exe" -ArgumentList ($arguments -join " ") -WindowStyle Hidden | Out-Null
+        }
+        catch {
+            Remove-Item -LiteralPath $requestPath -Force -ErrorAction SilentlyContinue
+            Write-AgentBellLog -Path $logPath -Level "error" -Message "Prewarm process failed to launch." -Data @{
+                error_type = $_.Exception.GetType().Name
+            } -MaxBytes ([int]$config.limits.log_bytes)
+        }
+    }
 }
 
 exit 0
