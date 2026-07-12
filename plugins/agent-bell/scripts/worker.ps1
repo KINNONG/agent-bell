@@ -21,6 +21,7 @@ $configPath = Join-Path $DataDir "config.json"
 $logPath = Join-Path $DataDir "logs\agent-bell.jsonl"
 $cacheDirectory = Join-Path $DataDir "cache"
 $prewarmCandidates = @()
+$prewarmLaunchLimit = 2
 $config = $null
 $state = $null
 
@@ -288,6 +289,9 @@ if ($null -ne $config -and $null -ne $state -and $prewarmCandidates.Count -gt 0)
     $prewarmScript = Join-Path $PluginRoot "scripts\prewarm.ps1"
     $launched = @{}
     foreach ($candidate in $prewarmCandidates) {
+        if ($launched.Count -ge $prewarmLaunchLimit) {
+            break
+        }
         if ($launched.ContainsKey([string]$candidate.key) -or -not (Test-AgentBellTurnActive -State $state -Key ([string]$candidate.key))) {
             continue
         }

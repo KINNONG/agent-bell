@@ -62,7 +62,7 @@ Lite 模式不需要 Python、GPU、模型文件或 API Key。
 把下面这句话发给 Codex：
 
 ~~~text
-请安装 https://github.com/KINNONG/agent-bell 的 v0.1.3：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.3 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；如果检测到我已经启用旧版 Qwen Voice Pack，核对并关闭它的进程后运行 voice-pack/update.ps1，再重新执行 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
+请以 Lite 模式安装 https://github.com/KINNONG/agent-bell 的 v0.1.4：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.4 和 codex plugin add agent-bell@agent-bell；只安装基础插件，不安装 Qwen Voice Pack、不下载任何模型；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
 ~~~
 
 安装过程中有两次必要确认：
@@ -138,7 +138,19 @@ Lite 是公开 v0.1 的默认模式：
 
 仓库包含一个可选的实验性 [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md)。它使用本地 Qwen3-TTS 0.6B Base 模型，从用户明确授权的参考音频生成自定义音色，并实现下面的本地 HTTP 接口。模型、Python 环境和私人音频不会进入插件仓库。
 
-Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及数 GB 磁盘空间。Lite 模式不需要这些条件。模型会在服务就绪前完成加载。对于完成事件，Agent Bell 会在任务运行期间提前生成并缓存完整播报；命中缓存时直接播放，缓存尚未准备好的极短任务只立即响一声提示音，不再等待现场合成。权限和失败播报仍使用按需合成，默认最多等待 30 秒后回退到 SAPI。
+这是独立于基础插件的大体积可选安装：预计下载 `5.5–6 GB`，安装后占用约 `7.8 GB`，新安装的目标磁盘必须至少有 `12 GiB`（约 `12.9 GB`）可用空间。最低硬件为 `16 GiB` 系统内存和 `6 GiB` NVIDIA 显存，推荐 `32 GiB` 系统内存和 `8 GiB` 显存，并需要 Python 3.12、CUDA、bfloat16 和计算能力 8.0 或更高版本。Lite 模式不需要其中任何条件，也不会下载模型。
+
+Voice Pack 的模型会在服务就绪前完成加载，并在服务运行期间常驻显存。完成播报的后台预生成会先等待并检查 CPU、内存与 GPU 余量；资源不足或关键指标无法可靠读取时会跳过本次生成，完成时立即响一次提示音，不会阻塞 Codex，也不会稍后补播。生成进程使用较低优先级且队列有界，但仍可能与剪辑、游戏或其他本地 AI 任务争用 GPU；这类工作期间可以继续使用 Lite，或关闭 Voice Pack 服务。权限和失败播报仍使用按需合成，默认最多等待 30 秒后回退到 SAPI。
+
+### 一句话让 Codex 安装自定义音色
+
+仅在确实需要自定义音色时，把下面这句话中的两个占位符替换为自己的授权资料，再发给 Codex：
+
+~~~text
+请为 Agent Bell v0.1.4 安装可选的本地 Qwen 自定义音色。开始任何下载或写入前，先向我明确展示并说明：预计下载 5.5–6 GB、安装后占用约 7.8 GB、新安装的目标磁盘必须至少有 12 GiB（约 12.9 GB）可用空间；最低硬件为 16 GiB 系统内存和 6 GiB NVIDIA 显存，推荐 32 GiB 系统内存和 8 GiB 显存。等我明确同意大体积下载后才能继续并传入 -ConfirmLargeDownload。参考音频使用 "<本人拥有或已取得明确授权的音频绝对路径>"，逐字准确台词是 "<与参考音频完全一致的准确台词>"；同时让我确认音色权利后再传入 -ConfirmVoiceRights。请提醒我：参考路径和台词会保留在当前 Codex 会话及工具调用记录中；不要把它们提交到仓库或写入 Agent Bell 日志。请定位并运行已安装插件的 voice-pack\install.ps1，让安装器先完成只读硬件与容量预检，只有通过后才继续下载并安装到空间充足的目录。安装后启动本地服务并验证健康检查与合成，只有通过后才把 provider 改为 http，再运行 Agent Bell Test 和 Doctor；资源不足时保留 SAPI 和提示音回退。
+~~~
+
+当前 v0.1.4 安装器使用固定 revision 的官方 Hugging Face 模型仓库。中国大陆网络访问 Hugging Face 可能较慢；Qwen 官方虽然为大陆用户提供 ModelScope 下载方式，但本版安装器还没有 ModelScope 切换参数。遇到下载条件不佳时应先使用无需模型的 Lite 模式，不要擅自改用未经校验的第三方镜像；后续版本可以增加经过校验的镜像源支持。
 
 服务要求：
 
@@ -165,7 +177,7 @@ Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及
 
 ### 从旧版 Voice Pack 升级
 
-`v0.1.3` 的低延迟完成播报需要 Voice Pack 提供 `/prewarm` 与 `/cached`。仅升级插件不会修改插件目录之外的私人 Voice Pack，因此现有用户还需要升级一次本地运行时。
+`v0.1.3` 引入了 `/prewarm` 与 `/cached` 低延迟播报，`v0.1.4` 进一步限制后台资源占用。仅升级插件不会修改插件目录之外的私人 Voice Pack，因此现有用户还需要升级一次本地运行时。
 
 先关闭当前 Voice Pack，确认 `127.0.0.1:17863` 已不再监听，然后从已安装插件根目录运行：
 

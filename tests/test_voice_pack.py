@@ -1,6 +1,9 @@
 import importlib.util
+import inspect
 import json
+import os
 import socket
+import subprocess
 import threading
 import time
 import unittest
@@ -130,6 +133,19 @@ class VoiceServiceCacheTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_prewarm_accepts_at_most_two_jobs_behind_active_generation(self) -> None:
+        service = ControlledVoiceService(block_generation=True)
+        try:
+            self.assertEqual(service.prewarm("active", "default"), "accepted")
+            self.assertTrue(service.generation_started.wait(timeout=1))
+            self.assertEqual(service.prewarm("queued one", "default"), "accepted")
+            self.assertEqual(service.prewarm("queued two", "default"), "accepted")
+            with self.assertRaises(SERVER.ServiceBusy):
+                service.prewarm("queue overflow", "default")
+        finally:
+            service.release_generation.set()
+            service.close()
+
     def test_close_drains_private_work_and_waits_for_active_generation(self) -> None:
         service = ControlledVoiceService(block_generation=True)
         closer = threading.Thread(target=service.close)
@@ -201,6 +217,101 @@ class VoiceServiceCacheTests(unittest.TestCase):
         cache.clear()
         self.assertEqual(cache._entries, {})
         self.assertEqual(cache._total_bytes, 0)
+
+
+class WindowsPriorityTests(unittest.TestCase):
+    def test_sets_below_normal_priority_best_effort_on_windows(self) -> None:
+        class FakeKernel32:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def GetCurrentProcess(self) -> int:
+                return 123
+
+            def SetPriorityClass(self, handle: int, priority: int) -> int:
+                self.calls.append((handle, priority))
+                return 1
+
+        kernel32 = FakeKernel32()
+
+        self.assertTrue(
+            SERVER.set_windows_below_normal_priority(
+                platform_name="nt", kernel32=kernel32
+            )
+        )
+        self.assertEqual(kernel32.calls, [(123, 0x00004000)])
+
+    def test_priority_failure_does_not_prevent_service_startup(self) -> None:
+        class FailingKernel32:
+            @staticmethod
+            def GetCurrentProcess() -> int:
+                raise OSError("priority unavailable")
+
+        self.assertFalse(
+            SERVER.set_windows_below_normal_priority(
+                platform_name="nt", kernel32=FailingKernel32()
+            )
+        )
+
+
+class PhysicalGpuSelectionTests(unittest.TestCase):
+    def test_pins_cuda_to_the_strict_uuid_reported_for_physical_gpu_zero(self) -> None:
+        names = ("CUDA_DEVICE_ORDER", "CUDA_VISIBLE_DEVICES")
+        previous = {name: os.environ.get(name) for name in names}
+        valid_uuid = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+        calls = []
+
+        def runner(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            calls.append((command, options))
+            return subprocess.CompletedProcess(command, 0, valid_uuid + "\n", "")
+
+        try:
+            os.environ["CUDA_DEVICE_ORDER"] = "FASTEST_FIRST"
+            os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+            selected = SERVER.pin_voice_service_to_physical_gpu_zero(runner=runner)
+
+            self.assertEqual(selected, valid_uuid)
+            self.assertEqual(os.environ["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], valid_uuid)
+            self.assertEqual(
+                calls[0][0],
+                [
+                    "nvidia-smi",
+                    "--id=0",
+                    "--query-gpu=uuid",
+                    "--format=csv,noheader,nounits",
+                ],
+            )
+            self.assertEqual(calls[0][1]["timeout"], 2.0)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_rejects_an_invalid_physical_gpu_uuid(self) -> None:
+        def runner(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, "GPU-not-a-uuid\n", "")
+
+        with self.assertRaisesRegex(RuntimeError, "invalid UUID"):
+            SERVER.pin_voice_service_to_physical_gpu_zero(runner=runner)
+
+    def test_gpu_uuid_query_has_a_hard_timeout(self) -> None:
+        def runner(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(command, options["timeout"])
+
+        with self.assertRaisesRegex(RuntimeError, "within two seconds"):
+            SERVER.pin_voice_service_to_physical_gpu_zero(runner=runner)
+
+    def test_pins_gpu_before_torch_is_imported_for_model_loading(self) -> None:
+        source = inspect.getsource(SERVER.VoiceService.__init__)
+
+        self.assertLess(
+            source.index("pin_voice_service_to_physical_gpu_zero()"),
+            source.index("import torch"),
+        )
 
 
 class VoicePackHttpContractTests(unittest.TestCase):

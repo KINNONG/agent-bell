@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -45,9 +46,13 @@ MAX_CACHE_ENTRIES = 32
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 CACHE_TTL_SECONDS = 2 * 60 * 60
 CACHE_SWEEP_SECONDS = 60
-MAX_PREWARM_QUEUE_ENTRIES = 8
+MAX_PREWARM_QUEUE_ENTRIES = 2
 
 VOICE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+GPU_UUID_PATTERN = re.compile(
+    r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
 REFERENCE_AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg")
 
 
@@ -61,6 +66,64 @@ class ServiceBusy(Exception):
 
 class ResponseTooLarge(Exception):
     """The generated audio exceeds the response limit."""
+
+
+def set_windows_below_normal_priority(
+    *, platform_name: str | None = None, kernel32: Any | None = None
+) -> bool:
+    """Lower CPU scheduling priority on Windows without making startup depend on it."""
+    if platform_name is None:
+        platform_name = os.name
+    if platform_name != "nt":
+        return False
+
+    try:
+        if kernel32 is None:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.SetPriorityClass.restype = ctypes.c_int
+        process_handle = kernel32.GetCurrentProcess()
+        if not process_handle:
+            return False
+        return bool(kernel32.SetPriorityClass(process_handle, 0x00004000))
+    except Exception:
+        return False
+
+
+def pin_voice_service_to_physical_gpu_zero(*, runner: Any = subprocess.run) -> str:
+    """Resolve physical GPU zero to a UUID before importing CUDA libraries."""
+    command = [
+        "nvidia-smi",
+        "--id=0",
+        "--query-gpu=uuid",
+        "--format=csv,noheader,nounits",
+    ]
+    options: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "ascii",
+        "errors": "strict",
+        "timeout": 2.0,
+        "check": False,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        result = runner(command, **options)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Could not resolve physical NVIDIA GPU zero within two seconds.") from exc
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 or len(lines) != 1 or not GPU_UUID_PATTERN.fullmatch(lines[0]):
+        raise RuntimeError("nvidia-smi returned an invalid UUID for physical GPU zero.")
+
+    gpu_uuid = lines[0]
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_uuid
+    return gpu_uuid
 
 
 class WavMemoryCache:
@@ -245,6 +308,7 @@ class VoiceService:
         if offline and not (local_model / "config.json").is_file():
             raise RuntimeError("The local Qwen3-TTS model is not installed.")
 
+        pin_voice_service_to_physical_gpu_zero()
         import torch
         from qwen_tts import Qwen3TTSModel
 
@@ -645,6 +709,7 @@ def serve(install_root: Path, requested_model: str | None = None) -> None:
     try:
         # Reserve the fixed loopback port before loading the model so duplicate
         # launches cannot consume GPU memory at the same time.
+        set_windows_below_normal_priority()
         service = VoiceService(install_root, requested_model=requested_model)
         VoiceRequestHandler.service = service
         print(

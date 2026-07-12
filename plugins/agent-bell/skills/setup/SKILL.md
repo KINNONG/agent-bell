@@ -13,6 +13,8 @@ Use this skill when the user asks to set up, test, diagnose, or uninstall Agent 
 - Never edit Codex `notify`, `config.toml`, hook trust hashes, or unrelated hooks.
 - Never claim that plugin installation implies hook trust.
 - After installing or changing hooks, ask the user to open `/hooks`, review the exact command, and trust it explicitly.
+- Default to model-free Lite mode. Never run `voice-pack\install.ps1`, install its Python dependencies, or download Qwen unless the user explicitly asks for a custom voice.
+- For a custom voice, follow `voice-pack\README.md`: disclose the download and hardware requirements, then wait for separate large-download and voice-rights confirmations.
 - Keep private voice data by default. Use `-PurgeData` only after the user explicitly asks to delete it.
 - Do not upload reference audio or logs.
 
