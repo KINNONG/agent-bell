@@ -75,7 +75,7 @@
 **Steps:**
 1. Make the primary one-sentence install explicitly Lite-only and model-free.
 2. Add a separate copyable Codex instruction for custom voice with placeholders for authorized audio and exact reference text.
-3. Disclose 5.5-6 GB download, approximately 7.8 GB installed size, 12 GB free-space requirement, and recommended 32 GB RAM / 8 GB VRAM.
+3. Disclose 5.5-6 GB download, approximately 7.8 GB installed size, 12 GiB free-space requirement, and recommended 32 GiB RAM / 8 GiB VRAM.
 4. Document automatic resource fallback and Mainland China download considerations.
 5. Bump the plugin version to `0.1.4`.
 

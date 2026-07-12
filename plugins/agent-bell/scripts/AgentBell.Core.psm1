@@ -253,6 +253,205 @@ function Write-AgentBellLog {
     }
 }
 
+function ConvertTo-AgentBellResourceMetric {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    try {
+        $number = [double]$Value
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) {
+            return $null
+        }
+        return $number
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-AgentBellPrewarmSlotNames {
+    param([Parameter(Mandatory = $true)][string]$DataDir)
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/').ToLowerInvariant()
+    $dataDirectoryHash = Get-AgentBellHash -Value $normalizedPath
+    return @(
+        "Local\AgentBellPrewarm-$dataDirectoryHash-0",
+        "Local\AgentBellPrewarm-$dataDirectoryHash-1"
+    )
+}
+
+function Invoke-AgentBellNvidiaSmiResourceQuery {
+    $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction Stop | Select-Object -First 1
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $nvidiaSmi.Source
+    $startInfo.Arguments = '--id=0 --query-gpu=memory.free,utilization.gpu --format=csv,noheader,nounits'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) {
+            return $null
+        }
+        if (-not $process.WaitForExit(2000)) {
+            try {
+                $process.Kill()
+                $process.WaitForExit(500) | Out-Null
+            }
+            catch {
+                # The query is best-effort and never changes the fail-closed policy.
+            }
+            return $null
+        }
+
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $process.StandardError.ReadToEnd() | Out-Null
+        if ($process.ExitCode -ne 0) {
+            return $null
+        }
+        return $standardOutput
+    }
+    finally {
+        if ($started) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                    $process.WaitForExit(500) | Out-Null
+                }
+            }
+            catch {
+                # Process cleanup is best-effort after a bounded query.
+            }
+        }
+        $process.Dispose()
+    }
+}
+
+function Get-AgentBellPrewarmResourceDecision {
+    param([object]$Snapshot)
+
+    $unavailable = [pscustomobject][ordered]@{
+        allowed = $false
+        reason = "metrics_unavailable"
+    }
+    if ($null -eq $Snapshot) {
+        return $unavailable
+    }
+
+    $metricNames = @(
+        "available_memory_bytes",
+        "cpu_percent",
+        "free_gpu_memory_mib",
+        "gpu_utilization_percent"
+    )
+    $metrics = @{}
+    foreach ($name in $metricNames) {
+        $property = $Snapshot.PSObject.Properties[$name]
+        if ($null -eq $property) {
+            return $unavailable
+        }
+        $number = ConvertTo-AgentBellResourceMetric -Value $property.Value
+        if ($null -eq $number) {
+            return $unavailable
+        }
+        $metrics[$name] = $number
+    }
+
+    if ($metrics.available_memory_bytes -lt 0 -or
+        $metrics.cpu_percent -lt 0 -or $metrics.cpu_percent -gt 100 -or
+        $metrics.free_gpu_memory_mib -lt 0 -or
+        $metrics.gpu_utilization_percent -lt 0 -or $metrics.gpu_utilization_percent -gt 100) {
+        return $unavailable
+    }
+    if ($metrics.available_memory_bytes -lt 2GB) {
+        return [pscustomobject][ordered]@{ allowed = $false; reason = "memory_low" }
+    }
+    if ($metrics.cpu_percent -gt 75) {
+        return [pscustomobject][ordered]@{ allowed = $false; reason = "cpu_busy" }
+    }
+    if ($metrics.free_gpu_memory_mib -lt 1536) {
+        return [pscustomobject][ordered]@{ allowed = $false; reason = "gpu_memory_low" }
+    }
+    if ($metrics.gpu_utilization_percent -gt 70) {
+        return [pscustomobject][ordered]@{ allowed = $false; reason = "gpu_busy" }
+    }
+
+    return [pscustomobject][ordered]@{ allowed = $true; reason = "ready" }
+}
+
+function Get-AgentBellResourceSnapshot {
+    $snapshot = [ordered]@{
+        available_memory_bytes  = $null
+        cpu_percent             = $null
+        free_gpu_memory_mib     = $null
+        gpu_utilization_percent = $null
+    }
+
+    try {
+        $operatingSystem = Get-CimInstance `
+            -ClassName Win32_OperatingSystem `
+            -OperationTimeoutSec 2 `
+            -ErrorAction Stop
+        $availableMemory = ConvertTo-AgentBellResourceMetric -Value $operatingSystem.FreePhysicalMemory
+        if ($null -ne $availableMemory -and $availableMemory -ge 0) {
+            $snapshot.available_memory_bytes = [int64]($availableMemory * 1KB)
+        }
+    }
+    catch {
+        # The policy fails closed when a metric cannot be collected.
+    }
+
+    try {
+        $processor = Get-CimInstance `
+            -ClassName Win32_PerfFormattedData_PerfOS_Processor `
+            -Filter "Name='_Total'" `
+            -OperationTimeoutSec 2 `
+            -ErrorAction Stop |
+            Select-Object -First 1
+        $cpuPercent = ConvertTo-AgentBellResourceMetric -Value $processor.PercentProcessorTime
+        if ($null -ne $cpuPercent -and $cpuPercent -ge 0 -and $cpuPercent -le 100) {
+            $snapshot.cpu_percent = $cpuPercent
+        }
+    }
+    catch {
+        # The policy fails closed when a metric cannot be collected.
+    }
+
+    try {
+        $queryOutput = Invoke-AgentBellNvidiaSmiResourceQuery
+        $lines = @([string]$queryOutput -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($lines.Count -gt 0) {
+            $fields = @($lines[0] -split ',')
+            if ($fields.Count -eq 2) {
+                $freeGpuMemory = 0.0
+                $gpuUtilization = 0.0
+                $style = [System.Globalization.NumberStyles]::Float
+                $culture = [System.Globalization.CultureInfo]::InvariantCulture
+                $freeValid = [double]::TryParse($fields[0].Trim(), $style, $culture, [ref]$freeGpuMemory)
+                $utilizationValid = [double]::TryParse($fields[1].Trim(), $style, $culture, [ref]$gpuUtilization)
+                if ($freeValid -and $freeGpuMemory -ge 0) {
+                    $snapshot.free_gpu_memory_mib = $freeGpuMemory
+                }
+                if ($utilizationValid -and $gpuUtilization -ge 0 -and $gpuUtilization -le 100) {
+                    $snapshot.gpu_utilization_percent = $gpuUtilization
+                }
+            }
+        }
+    }
+    catch {
+        # The policy fails closed when a metric cannot be collected.
+    }
+
+    return [pscustomobject]$snapshot
+}
+
 function Normalize-AgentBellTitle {
     param(
         [string]$Title,
@@ -1295,6 +1494,9 @@ Export-ModuleMember -Function @(
     "Get-AgentBellHash",
     "ConvertTo-AgentBellSafeLogData",
     "Write-AgentBellLog",
+    "Get-AgentBellPrewarmSlotNames",
+    "Get-AgentBellPrewarmResourceDecision",
+    "Get-AgentBellResourceSnapshot",
     "Normalize-AgentBellTitle",
     "ConvertTo-AgentBellTitle",
     "Get-AgentBellRolloutThreadSource",

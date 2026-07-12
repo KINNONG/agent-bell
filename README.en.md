@@ -62,7 +62,7 @@ Lite mode does not require Python, a GPU, model files, or an API key.
 Send this sentence to Codex:
 
 ~~~text
-Install Agent Bell v0.1.3 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.3 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. If an older Qwen Voice Pack is enabled, verify and stop its process, run voice-pack/update.ps1, and run Doctor again. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
+Install Agent Bell v0.1.4 in Lite mode from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.4 and codex plugin add agent-bell@agent-bell, and install only the base plugin: do not install the Qwen Voice Pack or download any model. Ask me to confirm any required Plugins prompt, locate the installed plugin root, and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
 ~~~
 
 There are two intentional confirmations:
@@ -138,7 +138,19 @@ The default `always` mode speaks every Complete event. To reduce interruptions f
 
 The repository includes an optional experimental [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md). It uses the local Qwen3-TTS 0.6B Base model to create a custom voice from user-authorized reference audio and implements the localhost HTTP contract below. Model weights, the Python environment, and private audio stay outside the plugin repository.
 
-The Voice Pack requires Python 3.12, an NVIDIA GPU with CUDA and bfloat16 support, and several gigabytes of disk space. Lite mode requires none of these. For completion events, Agent Bell prepares the exact announcement while the task runs and plays it from cache. A very short task whose cache is not ready plays one prompt sound instead of waiting for synthesis. Permission and failure announcements still use on-demand synthesis with a 30-second timeout and SAPI fallback.
+This is a large, separate, optional installation: expect a `5.5–6 GB` download and approximately `7.8 GB` installed, with at least `12 GiB` (about `12.9 GB`) free on the destination drive before a new installation. The hardware minimum is `16 GiB` of system RAM and `6 GiB` of NVIDIA VRAM; `32 GiB` of RAM and `8 GiB` of VRAM are recommended. Python 3.12, CUDA, bfloat16, and compute capability 8.0 or newer are also required. Lite mode requires none of these and downloads no model.
+
+The model loads before the Voice Pack becomes ready and remains resident in VRAM while the service runs. Background completion preparation waits and checks CPU, RAM, and GPU headroom first. If resources are insufficient or critical metrics cannot be read reliably, Agent Bell skips that generation and plays one prompt sound at completion without blocking Codex or replaying the announcement later. The generation process uses lower priority and a bounded queue, but it can still contend with video editors, games, or other local AI workloads; use Lite or stop the Voice Pack service during such work. Permission and failure announcements still use on-demand synthesis with a 30-second timeout and SAPI fallback.
+
+### One-Sentence Custom-Voice Installation
+
+Only when a custom voice is needed, replace the two placeholders below with authorized material and send the sentence to Codex:
+
+~~~text
+Install the optional local Qwen custom voice for Agent Bell v0.1.4. Before any download or write, show me and explain that the expected download is 5.5–6 GB, the installed size is approximately 7.8 GB, and a new installation requires at least 12 GiB (about 12.9 GB) free on the destination drive. Explain that the hardware minimum is 16 GiB of system RAM and 6 GiB of NVIDIA VRAM, while 32 GiB of RAM and 8 GiB of VRAM are recommended. Wait for my explicit approval of the large download before continuing or passing -ConfirmLargeDownload. Use "<absolute path to audio that I own or am explicitly authorized to use>" as the reference audio and "<exact word-for-word transcript matching the reference audio>" as its transcript; ask me to confirm the voice rights before passing -ConfirmVoiceRights. Warn me that the reference path and transcript remain visible in this Codex task and its tool-call history; do not commit them to the repository or write them to Agent Bell logs. Locate and run voice-pack\install.ps1 under the installed plugin, let the installer complete its read-only hardware and capacity preflight, and continue downloading and installing to a drive with sufficient space only if that preflight passes. Start the local service after installation and verify its health and synthesis checks; change provider to http only after they pass, then run Agent Bell Test and Doctor. Retain SAPI and prompt-sound fallback when resources are insufficient.
+~~~
+
+The v0.1.4 installer uses the official Hugging Face model repository at a pinned revision. Hugging Face downloads may be slow from Mainland China. Although Qwen documents ModelScope as a download route for Mainland China, this installer does not yet expose a ModelScope switch. Use model-free Lite mode when the download path is unsuitable, and do not substitute an unverified third-party mirror; a future version can add a verified mirror source.
 
 The service must:
 
@@ -165,7 +177,7 @@ Example configuration:
 
 ### Upgrading an Existing Voice Pack
 
-The `v0.1.3` low-latency completion path requires `/prewarm` and `/cached`. A plugin upgrade cannot modify a private Voice Pack installed outside the plugin directory, so existing users must update that local runtime once.
+`v0.1.3` introduced the `/prewarm` and `/cached` low-latency path, and `v0.1.4` further bounds background resource pressure. A plugin upgrade cannot modify a private Voice Pack installed outside the plugin directory, so existing users must update that local runtime once.
 
 Stop the current Voice Pack and confirm that `127.0.0.1:17863` is no longer listening, then run this from the installed plugin root:
 

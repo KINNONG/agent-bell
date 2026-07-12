@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$ConfirmVoiceRights,
+    [switch]$ConfirmLargeDownload,
     [Parameter(Mandatory = $true)][string]$ReferenceAudio,
     [Parameter(Mandatory = $true)][string]$ReferenceText,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$VoiceId = 'default',
@@ -39,12 +40,157 @@ function Get-FullPath {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
 }
 
+function Test-CompleteVoicePackInstallation {
+    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+
+    $requiredFiles = @(
+        '.agent-bell-qwen-voice-pack',
+        '.venv\Scripts\python.exe',
+        '.venv\Lib\site-packages\torch\__init__.py',
+        '.venv\Lib\site-packages\torchaudio\__init__.py',
+        '.venv\Lib\site-packages\qwen_tts\__init__.py',
+        'models\Qwen3-TTS-12Hz-0.6B-Base\config.json',
+        'models\Qwen3-TTS-12Hz-0.6B-Base\model.safetensors',
+        'models\Qwen3-TTS-12Hz-0.6B-Base\speech_tokenizer\config.json',
+        'models\Qwen3-TTS-12Hz-0.6B-Base\speech_tokenizer\model.safetensors'
+    )
+    foreach ($relativePath in $requiredFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot $relativePath) -PathType Leaf)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function ConvertFrom-VoicePackNvidiaSmiOutput {
+    param([Parameter(Mandatory = $true)][object[]]$Lines)
+
+    foreach ($lineValue in $Lines) {
+        $parts = ([string]$lineValue).Split(',')
+        if ($parts.Count -ne 4) {
+            continue
+        }
+
+        [int]$index = -1
+        if (-not [int]::TryParse($parts[0].Trim(), [ref]$index) -or $index -ne 0) {
+            continue
+        }
+
+        $gpuUuid = $parts[1].Trim()
+        if ($gpuUuid -notmatch '^GPU-[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$') {
+            throw 'nvidia-smi returned an invalid UUID for CUDA device 0.'
+        }
+
+        [double]$computeCapability = 0
+        [int64]$vramMiB = 0
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $numberStyle = [System.Globalization.NumberStyles]::Float
+        if (-not [double]::TryParse($parts[2].Trim(), $numberStyle, $culture, [ref]$computeCapability) -or
+            -not [int64]::TryParse($parts[3].Trim(), $numberStyle, $culture, [ref]$vramMiB)) {
+            throw 'nvidia-smi returned invalid compute capability or memory data for CUDA device 0.'
+        }
+
+        return [pscustomobject][ordered]@{
+            Index = $index
+            Uuid = $gpuUuid
+            ComputeCapability = $computeCapability
+            VramMiB = $vramMiB
+        }
+    }
+
+    throw 'nvidia-smi did not report CUDA device 0.'
+}
+
+function Assert-VoicePackPlatformPreflight {
+    param(
+        [Parameter(Mandatory = $true)][bool]$IsWindows,
+        [Parameter(Mandatory = $true)][bool]$NvidiaSmiAvailable
+    )
+
+    if (-not $IsWindows) {
+        throw 'This Voice Pack installer supports Windows only.'
+    }
+    if (-not $NvidiaSmiAvailable) {
+        throw 'nvidia-smi was not found. A compatible NVIDIA GPU and driver are required before downloading the Voice Pack.'
+    }
+}
+
+function Get-VoicePackHardwareProfile {
+    param([Parameter(Mandatory = $true)][string]$NvidiaSmiPath)
+
+    $gpuOutput = & $NvidiaSmiPath `
+        '--query-gpu=index,uuid,compute_cap,memory.total' `
+        '--format=csv,noheader,nounits' 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'nvidia-smi could not query CUDA device 0. Update the NVIDIA driver before downloading the Voice Pack.'
+    }
+    $gpu = ConvertFrom-VoicePackNvidiaSmiOutput -Lines @($gpuOutput)
+
+    $memoryModules = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+    [int64]$ramBytes = ($memoryModules | Measure-Object -Property Capacity -Sum).Sum
+    if ($ramBytes -le 0) {
+        throw 'Windows did not report installed physical memory.'
+    }
+
+    return [pscustomobject][ordered]@{
+        ComputeCapability = [double]$gpu.ComputeCapability
+        VramMiB = [int64]$gpu.VramMiB
+        RamBytes = $ramBytes
+        GpuUuid = [string]$gpu.Uuid
+    }
+}
+
+function Get-VoicePackAvailableDiskBytes {
+    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+
+    $volumeRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($InstallRoot))
+    if ([string]::IsNullOrWhiteSpace($volumeRoot)) {
+        throw 'The Voice Pack installation volume could not be determined.'
+    }
+    $drive = New-Object System.IO.DriveInfo($volumeRoot)
+    if (-not $drive.IsReady) {
+        throw "The Voice Pack installation volume is not ready: $volumeRoot"
+    }
+    return [int64]$drive.AvailableFreeSpace
+}
+
+function Assert-VoicePackInstallPreflight {
+    param(
+        [Parameter(Mandatory = $true)][double]$ComputeCapability,
+        [Parameter(Mandatory = $true)][int64]$VramMiB,
+        [Parameter(Mandatory = $true)][int64]$RamBytes,
+        [Parameter(Mandatory = $true)][int64]$AvailableDiskBytes,
+        [Parameter(Mandatory = $true)][bool]$CompleteExistingInstallation
+    )
+
+    if ($ComputeCapability -lt 8.0) {
+        throw "The Voice Pack requires NVIDIA compute capability 8.0 or newer; CUDA device 0 reported $ComputeCapability."
+    }
+    if ($VramMiB -lt 6144) {
+        throw "The Voice Pack requires at least 6 GiB of VRAM on CUDA device 0; nvidia-smi reported $VramMiB MiB."
+    }
+    if ($RamBytes -lt 16GB) {
+        throw 'The Voice Pack requires at least 16 GiB of installed RAM.'
+    }
+
+    [int64]$requiredDiskBytes = if ($CompleteExistingInstallation) { 2GB } else { 12GB }
+    if ($AvailableDiskBytes -lt $requiredDiskBytes) {
+        $requiredGiB = [int]($requiredDiskBytes / 1GB)
+        $availableGiB = [Math]::Round($AvailableDiskBytes / 1GB, 1)
+        throw "The Voice Pack requires at least $requiredGiB GiB free on the installation volume; only $availableGiB GiB is available."
+    }
+}
+
 if (-not $ConfirmVoiceRights.IsPresent) {
     throw 'Installation requires -ConfirmVoiceRights. Only clone a voice you own or have explicit permission to use.'
 }
-if ($env:OS -ne 'Windows_NT') {
-    throw 'This Voice Pack installer supports Windows only.'
+if (-not $ConfirmLargeDownload.IsPresent) {
+    throw 'Installation requires -ConfirmLargeDownload because the optional model and CUDA environment download several gigabytes.'
 }
+$nvidiaSmi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
+Assert-VoicePackPlatformPreflight `
+    -IsWindows ($env:OS -eq 'Windows_NT') `
+    -NvidiaSmiAvailable ($null -ne $nvidiaSmi)
 if ([string]::IsNullOrWhiteSpace($ReferenceText)) {
     throw 'ReferenceText cannot be empty.'
 }
@@ -78,7 +224,23 @@ if (Test-Path -LiteralPath $fullInstallRoot -PathType Container) {
         throw "Refusing to install into a non-empty unmarked directory: $fullInstallRoot"
     }
 }
-else {
+
+$hardwareProfile = Get-VoicePackHardwareProfile -NvidiaSmiPath $nvidiaSmi.Source
+$completeExistingInstallation = Test-CompleteVoicePackInstallation -InstallRoot $fullInstallRoot
+$availableDiskBytes = Get-VoicePackAvailableDiskBytes -InstallRoot $fullInstallRoot
+Assert-VoicePackInstallPreflight `
+    -ComputeCapability ([double]$hardwareProfile.ComputeCapability) `
+    -VramMiB ([int64]$hardwareProfile.VramMiB) `
+    -RamBytes ([int64]$hardwareProfile.RamBytes) `
+    -AvailableDiskBytes $availableDiskBytes `
+    -CompleteExistingInstallation $completeExistingInstallation
+
+# Keep Python validation and the service on the same physical GPU inspected by
+# nvidia-smi, even when the parent process has a different CUDA visibility map.
+$env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
+$env:CUDA_VISIBLE_DEVICES = [string]$hardwareProfile.GpuUuid
+
+if (-not (Test-Path -LiteralPath $fullInstallRoot -PathType Container)) {
     [System.IO.Directory]::CreateDirectory($fullInstallRoot) | Out-Null
 }
 
@@ -139,13 +301,13 @@ Invoke-CheckedCommand -FilePath $venvPython -Arguments @(
 ) -Description 'Isolated Python version validation'
 
 Invoke-CheckedCommand -FilePath $venvPython -Arguments @(
-    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--upgrade', 'pip'
+    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--no-cache-dir', '--upgrade', 'pip'
 ) -Description 'pip upgrade'
 
 # Install the CUDA pair first. The later qwen-tts install will recognize these
 # exact wheels as satisfying its torch dependencies instead of fetching CPU wheels.
 Invoke-CheckedCommand -FilePath $venvPython -Arguments @(
-    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
+    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--no-cache-dir',
     '--index-url', $PyTorchIndex,
     "torch==$TorchVersion",
     "torchaudio==$TorchAudioVersion"
@@ -153,7 +315,7 @@ Invoke-CheckedCommand -FilePath $venvPython -Arguments @(
 
 $requirementsPath = Join-Path $appDirectory 'requirements.txt'
 Invoke-CheckedCommand -FilePath $venvPython -Arguments @(
-    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
+    '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--no-cache-dir',
     '--index-url', 'https://pypi.org/simple',
     '--requirement', $requirementsPath
 ) -Description "qwen-tts $QwenTtsVersion installation"
@@ -169,11 +331,13 @@ valid = (
     torch.__version__ == expected_torch
     and torchaudio.__version__ == expected_audio
     and torch.cuda.is_available()
+    and torch.cuda.is_bf16_supported()
 )
 payload = {
     "torch": torch.__version__,
     "torchaudio": torchaudio.__version__,
     "cuda_available": torch.cuda.is_available(),
+    "bf16_supported": torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
     "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
 }
 print(json.dumps(payload, ensure_ascii=True))

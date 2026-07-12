@@ -383,6 +383,99 @@ Describe 'Agent Bell local voice boundary' {
     }
 }
 
+Describe 'Agent Bell prewarm resource policy' {
+    BeforeEach {
+        $script:healthyResourceSnapshot = [pscustomobject]@{
+            available_memory_bytes   = 2GB
+            cpu_percent              = 75
+            free_gpu_memory_mib      = 1536
+            gpu_utilization_percent  = 70
+        }
+    }
+
+    It 'allows every metric exactly on its resource boundary' {
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $true
+        $decision.reason | Should Be 'ready'
+    }
+
+    It 'denies available memory below two GiB' {
+        $script:healthyResourceSnapshot.available_memory_bytes = 2GB - 1
+
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $false
+        $decision.reason | Should Be 'memory_low'
+    }
+
+    It 'denies total CPU use above seventy-five percent' {
+        $script:healthyResourceSnapshot.cpu_percent = 75.01
+
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $false
+        $decision.reason | Should Be 'cpu_busy'
+    }
+
+    It 'denies free GPU memory below 1.5 GiB' {
+        $script:healthyResourceSnapshot.free_gpu_memory_mib = 1535
+
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $false
+        $decision.reason | Should Be 'gpu_memory_low'
+    }
+
+    It 'denies GPU utilization above seventy percent' {
+        $script:healthyResourceSnapshot.gpu_utilization_percent = 70.01
+
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $false
+        $decision.reason | Should Be 'gpu_busy'
+    }
+
+    It 'fails closed when a critical metric is unavailable' {
+        $script:healthyResourceSnapshot.free_gpu_memory_mib = $null
+
+        $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
+
+        $decision.allowed | Should Be $false
+        $decision.reason | Should Be 'metrics_unavailable'
+    }
+
+    It 'exposes snapshot collection separately from the pure policy' {
+        (Get-Command Get-AgentBellResourceSnapshot -ErrorAction SilentlyContinue) -ne $null |
+            Should Be $true
+    }
+
+    It 'collects GPU headroom from the same device zero used by the voice server' {
+        Get-Content -Raw -Encoding UTF8 -LiteralPath $modulePath |
+            Should Match ([regex]::Escape('--id=0'))
+    }
+
+    It 'derives exactly two privacy-safe helper slots isolated by data directory' {
+        $first = @(Get-AgentBellPrewarmSlotNames -DataDir 'C:\agent-bell\one')
+        $same = @(Get-AgentBellPrewarmSlotNames -DataDir 'c:\AGENT-BELL\one\')
+        $other = @(Get-AgentBellPrewarmSlotNames -DataDir 'C:\agent-bell\two')
+
+        $first.Count | Should Be 2
+        ($first -join ',') | Should Match '^Local\\AgentBellPrewarm-[0-9a-f]{64}-0,Local\\AgentBellPrewarm-[0-9a-f]{64}-1$'
+        ($same -join ',') | Should Be ($first -join ',')
+        ($other -join ',') | Should Not Be ($first -join ',')
+        ($first -join ',') | Should Not Match ([regex]::Escape('agent-bell\one'))
+    }
+
+    It 'bounds every external resource probe to about two seconds' {
+        $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $modulePath
+
+        ([regex]::Matches($source, '-OperationTimeoutSec\s+2')).Count | Should Be 2
+        $source | Should Match 'WaitForExit\(2000\)'
+        $source | Should Match '\.Kill\(\)'
+    }
+}
+
 Describe 'Agent Bell dedupe pruning' {
     It 'drops expired entries, keeps only the newest duplicate, and caps state size' {
         $now = [DateTimeOffset]::Parse('2026-07-12T10:00:00Z')

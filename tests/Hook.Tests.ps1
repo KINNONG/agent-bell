@@ -55,22 +55,41 @@ function Get-AgentBellTestPort {
     }
 }
 
+function New-AgentBellAllowedResourceSnapshot {
+    return [pscustomobject]@{
+        available_memory_bytes  = 2GB
+        cpu_percent             = 75
+        free_gpu_memory_mib     = 1536
+        gpu_utilization_percent = 70
+    }
+}
+
 function Start-AgentBellTestServer {
     param(
         [int]$Port,
         [int]$StatusCode,
         [string]$ContentType,
         [byte[]]$ResponseBody,
-        [int]$DelayMilliseconds = 0
+        [int]$DelayMilliseconds = 0,
+        [int]$WaitTimeoutMilliseconds = 0
     )
 
-    $job = Start-Job -ArgumentList $Port, $StatusCode, $ContentType, $ResponseBody, $DelayMilliseconds -ScriptBlock {
-        param($Port, $StatusCode, $ContentType, [byte[]]$ResponseBody, $DelayMilliseconds)
+    $job = Start-Job -ArgumentList $Port, $StatusCode, $ContentType, $ResponseBody, $DelayMilliseconds, $WaitTimeoutMilliseconds -ScriptBlock {
+        param($Port, $StatusCode, $ContentType, [byte[]]$ResponseBody, $DelayMilliseconds, $WaitTimeoutMilliseconds)
         $listener = New-Object System.Net.HttpListener
         $listener.Prefixes.Add("http://127.0.0.1:$Port/")
         $listener.Start()
         try {
-            $context = $listener.GetContext()
+            if ($WaitTimeoutMilliseconds -gt 0) {
+                $pendingContext = $listener.BeginGetContext($null, $null)
+                if (-not $pendingContext.AsyncWaitHandle.WaitOne($WaitTimeoutMilliseconds)) {
+                    return [pscustomobject]@{ received = $false }
+                }
+                $context = $listener.EndGetContext($pendingContext)
+            }
+            else {
+                $context = $listener.GetContext()
+            }
             $reader = New-Object System.IO.StreamReader($context.Request.InputStream, [System.Text.Encoding]::UTF8)
             try {
                 $body = $reader.ReadToEnd()
@@ -92,6 +111,7 @@ function Start-AgentBellTestServer {
                 # Timeout tests may close the client before the response is written.
             }
             [pscustomobject]@{
+                received = $true
                 path = $context.Request.Url.AbsolutePath
                 body = $body
             }
@@ -139,6 +159,73 @@ Describe 'Agent Bell hook queue' {
         Get-Content -Raw -Encoding UTF8 -LiteralPath $outsidePath | Should Be '{"private":"keep"}'
     }
 
+    It 'drops a ticket immediately when both data-directory helper slots are occupied' {
+        $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+        New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+        $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+        [System.IO.File]::WriteAllText($requestPath, '{"private":"ticket"}', (New-Object System.Text.UTF8Encoding($false)))
+        $holders = @()
+        try {
+            foreach ($slotName in @(Get-AgentBellPrewarmSlotNames -DataDir $script:dataDir)) {
+                $holders += Start-Job -ArgumentList $slotName -ScriptBlock {
+                    param($Name)
+                    $mutex = New-Object System.Threading.Mutex($false, $Name)
+                    $owned = $false
+                    try {
+                        $owned = $mutex.WaitOne(0)
+                        [pscustomobject]@{ ready = $owned }
+                        Start-Sleep -Seconds 10
+                    }
+                    finally {
+                        if ($owned) {
+                            $mutex.ReleaseMutex()
+                        }
+                        $mutex.Dispose()
+                    }
+                }
+            }
+            $deadline = (Get-Date).AddSeconds(5)
+            do {
+                $readyCount = @($holders | Where-Object {
+                    @((Receive-Job -Job $_ -Keep -ErrorAction SilentlyContinue) | Where-Object { $_.ready }).Count -gt 0
+                }).Count
+                if ($readyCount -lt 2) {
+                    Start-Sleep -Milliseconds 100
+                }
+            } while ($readyCount -lt 2 -and (Get-Date) -lt $deadline)
+            $readyCount | Should Be 2
+
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            & $prewarmPath `
+                -PluginRoot $pluginRoot `
+                -DataDir $script:dataDir `
+                -CodexHome (Join-Path $script:dataDir 'codex-home') `
+                -RequestPath $requestPath
+            $stopwatch.Stop()
+
+            ($stopwatch.ElapsedMilliseconds -lt 2000) | Should Be $true
+            Test-Path -LiteralPath $requestPath | Should Be $false
+        }
+        finally {
+            $holders | Stop-Job -ErrorAction SilentlyContinue
+            $holders | Remove-Job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rechecks config and active state after collection before sending HTTP' {
+        $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $prewarmPath
+        $pattern = '\$resourceDecision\s*=.*?[\s\S]+?Get-AgentBellConfig[\s\S]+?Get-AgentBellState[\s\S]+?Invoke-AgentBellHttpPrewarm'
+
+        $source | Should Match $pattern
+    }
+
+    It 'caps each worker pass at two detached prewarm launches' {
+        $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $workerPath
+
+        $source | Should Match '\$prewarmLaunchLimit\s*=\s*2'
+        $source | Should Match 'foreach\s*\(\$candidate\s+in\s+\$prewarmCandidates\)[\s\S]+?\$launched\.Count\s+-ge\s+\$prewarmLaunchLimit[\s\S]+?break'
+    }
+
     It 'prewarms the exact completion announcement only for an active turn with a real Codex title' {
         $port = Get-AgentBellTestPort
         $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
@@ -175,7 +262,13 @@ Describe 'Agent Bell hook queue' {
             })
 
             $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-            & $prewarmPath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -RequestPath $requestPath -DelaySeconds 7
+            & $prewarmPath `
+                -PluginRoot $pluginRoot `
+                -DataDir $script:dataDir `
+                -CodexHome $codexHome `
+                -RequestPath $requestPath `
+                -DelaySeconds 0 `
+                -ResourceSnapshot (New-AgentBellAllowedResourceSnapshot)
             $stopwatch.Stop()
 
             $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
@@ -185,6 +278,99 @@ Describe 'Agent Bell hook queue' {
             $payload.voice_id | Should Be 'default'
             ($stopwatch.ElapsedMilliseconds -lt 3000) | Should Be $true
             Test-Path -LiteralPath $requestPath | Should Be $false
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'waits ten seconds before looking up an already available title by default' {
+        $config = Get-AgentBellDefaultConfig
+        $config.voice.provider = 'http'
+        $config.voice.http.endpoint = 'http://127.0.0.1:9/synthesize'
+        $config.voice.http.timeout_seconds = 1
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $sessionId = '58585858-5858-5858-5858-585858585858'
+        $turnId = 'turn-default-delay'
+        $codexHome = Join-Path $script:dataDir 'codex-home'
+        New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+        $titleRow = [ordered]@{ id = $sessionId; thread_name = '已经存在的标题' } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+        $state = Set-AgentBellTurnStart -State (Get-AgentBellState) -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+        $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+        New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+        $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+        Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+            schema_version = 1
+            session_id = $sessionId
+            turn_id = $turnId
+            thread_source = 'user'
+        })
+
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        & $prewarmPath `
+            -PluginRoot $pluginRoot `
+            -DataDir $script:dataDir `
+            -CodexHome $codexHome `
+            -RequestPath $requestPath `
+            -ResourceSnapshot (New-AgentBellAllowedResourceSnapshot)
+        $stopwatch.Stop()
+
+        ($stopwatch.ElapsedMilliseconds -ge 9500) | Should Be $true
+        ($stopwatch.ElapsedMilliseconds -lt 15000) | Should Be $true
+        Test-Path -LiteralPath $requestPath | Should Be $false
+    }
+
+    It 'skips denied resource snapshots without HTTP or private log data' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 202 -ContentType 'application/json' -ResponseBody $responseBody -WaitTimeoutMilliseconds 2000
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+            $sessionId = '59595959-5959-5959-5959-595959595959'
+            $turnId = 'private-turn-resource-denied'
+            $privateTitle = '绝密资源检测会话'
+            $codexHome = Join-Path $script:dataDir 'codex-home'
+            New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+            $titleRow = [ordered]@{ id = $sessionId; thread_name = $privateTitle } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+            $state = Set-AgentBellTurnStart -State (Get-AgentBellState) -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+            $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+            New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+            $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+            Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+                schema_version = 1
+                session_id = $sessionId
+                turn_id = $turnId
+                thread_source = 'user'
+            })
+            $deniedSnapshot = New-AgentBellAllowedResourceSnapshot
+            $deniedSnapshot.available_memory_bytes = 2GB - 1
+
+            & $prewarmPath `
+                -PluginRoot $pluginRoot `
+                -DataDir $script:dataDir `
+                -CodexHome $codexHome `
+                -RequestPath $requestPath `
+                -DelaySeconds 0 `
+                -ResourceSnapshot $deniedSnapshot
+
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $result.received | Should Be $false
+            $entry = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl') | ConvertFrom-Json
+            (($entry.data.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') | Should Be 'reason'
+            $entry.data.reason | Should Be 'memory_low'
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($privateTitle))
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($sessionId))
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($turnId))
         }
         finally {
             Stop-Job -Job $server -ErrorAction SilentlyContinue
