@@ -1,0 +1,20 @@
+{
+  "name": "agent-bell",
+  "interface": {
+    "displayName": "Agent Bell"
+  },
+  "plugins": [
+    {
+      "name": "agent-bell",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-bell"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

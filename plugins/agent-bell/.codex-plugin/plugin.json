@@ -1,0 +1,36 @@
+{
+  "name": "agent-bell",
+  "version": "0.1.0",
+  "description": "Windows-first voice notifications that call you back when Codex completes a turn or needs attention.",
+  "author": {
+    "name": "KINNONG"
+  },
+  "homepage": "https://github.com/KINNONG/agent-bell",
+  "repository": "https://github.com/KINNONG/agent-bell",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "notifications",
+    "text-to-speech",
+    "windows",
+    "productivity"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Bell",
+    "shortDescription": "Hear when Codex needs your attention",
+    "longDescription": "Agent Bell announces completed Codex turns, permission requests, and conservative failure signals on Windows. It works with Windows SAPI and can use an optional local custom-voice provider.",
+    "developerName": "KINNONG",
+    "category": "Productivity",
+    "websiteURL": "https://github.com/KINNONG/agent-bell",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Set up Agent Bell and run a test announcement."
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

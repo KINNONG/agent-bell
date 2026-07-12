@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "mode": "smart",
+  "duration_threshold_seconds": 60,
+  "idle_threshold_seconds": 45,
+  "stop_debounce_seconds": 15,
+  "max_title_characters": 60,
+  "templates": {
+    "complete": "主人，{title} 任务已完成，请回来查看了。",
+    "permission": "主人，{title} 正在等待您的确认，请回来处理。",
+    "failure": "主人，{title} 执行遇到问题，请回来查看。"
+  },
+  "voice": {
+    "provider": "sapi",
+    "fallback_provider": "sapi",
+    "sapi_voice": "Microsoft Huihui Desktop",
+    "rate": 0,
+    "volume": 100,
+    "http": {
+      "endpoint": "http://127.0.0.1:17863/synthesize",
+      "timeout_seconds": 60,
+      "voice_id": "default"
+    }
+  },
+  "notifications": {
+    "short_active_turn": "toast"
+  },
+  "limits": {
+    "state_entries": 500,
+    "log_bytes": 1048576,
+    "queue_entries": 500,
+    "queue_ttl_hours": 168,
+    "failed_entries": 100,
+    "max_wav_bytes": 26214400
+  }
+}

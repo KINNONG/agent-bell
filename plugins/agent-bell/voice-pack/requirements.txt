@@ -1,0 +1,2 @@
+# CUDA torch and torchaudio are installed as a matched pair by install.ps1.
+qwen-tts==0.1.1

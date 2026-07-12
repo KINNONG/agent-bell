@@ -1,0 +1,53 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the supported Pester version
+        shell: powershell
+        run: |
+          Install-Module Pester -RequiredVersion 3.4.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -Force
+          $result = Invoke-Pester .\tests -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Validate PowerShell and JSON syntax
+        shell: powershell
+        run: |
+          $parseErrors = @()
+          Get-ChildItem -Recurse -Include *.ps1,*.psm1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            $parseErrors += $errors
+          }
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List
+            exit 1
+          }
+
+          Get-ChildItem -Recurse -Filter *.json | ForEach-Object {
+            Get-Content -Raw -Encoding UTF8 $_.FullName | ConvertFrom-Json | Out-Null
+          }
+
+      - name: Test the optional Voice Pack HTTP contract
+        shell: powershell
+        run: python -m unittest discover -s tests -p "test_*.py" -v

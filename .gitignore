@@ -1,0 +1,30 @@
+# Local runtime and user configuration
+runtime/
+.agent-bell-data/
+plugins/agent-bell/config.json
+plugins/agent-bell/voices/
+plugins/agent-bell/cache/
+
+# Private or generated audio
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+
+# Optional local voice-pack environments and model weights
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# Local secrets and generated output
+.env
+.env.*
+*.log
+*.tmp
