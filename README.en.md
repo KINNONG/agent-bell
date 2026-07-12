@@ -18,6 +18,8 @@ Agent Bell is an unofficial open-source project. It is not affiliated with or en
 
 The UserPromptSubmit hook records only the start time of the turn. It does not speak or persist the user prompt.
 
+Scheduled Codex automation runs are silent by default, including completion, failure, and permission events. Agent Bell uses the local rollout's `thread_source=automation` metadata rather than guessing from the title. Normal user-started or resumed threads still notify.
+
 Default Chinese templates:
 
 - Complete: 主人，{title} 任务已完成，请回来查看了。
@@ -59,7 +61,7 @@ Lite mode does not require Python, a GPU, model files, or an API key.
 Send this sentence to Codex:
 
 ~~~text
-Install Agent Bell v0.1.1 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.1 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
+Install Agent Bell v0.1.2 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.2 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
 ~~~
 
 There are two intentional confirmations:
@@ -112,11 +114,13 @@ Common settings:
 | mode | always | Completion notification policy |
 | duration_threshold_seconds | 60 | Speak after a turn reaches this duration |
 | idle_threshold_seconds | 45 | Speak after Windows reaches this idle duration |
-| stop_debounce_seconds | 15 | Wait for another Stop hook to continue the task before announcing |
+| stop_debounce_seconds | 5 | Wait for another Stop hook to continue the task before announcing |
 | max_title_characters | 60 | Maximum spoken title length |
 | voice.sapi_voice | Microsoft Huihui Desktop | Preferred SAPI voice |
 | voice.rate | 0 | SAPI rate from -10 to 10 |
 | voice.volume | 100 | SAPI volume from 0 to 100 |
+| voice.http.timeout_seconds | 30 | Fall back to SAPI after a local voice timeout |
+| notifications.automation_runs | none | Keep automation runs silent; normal restores notifications |
 
 ## Notification Policies
 
@@ -133,7 +137,7 @@ The default `always` mode speaks every Complete event. To reduce interruptions f
 
 The repository includes an optional experimental [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md). It uses the local Qwen3-TTS 0.6B Base model to create a custom voice from user-authorized reference audio and implements the generic HTTP contract below. Model weights, the Python environment, and private audio stay outside the plugin repository; failures still fall back to SAPI.
 
-The Voice Pack requires Python 3.12, an NVIDIA GPU with CUDA and bfloat16 support, and several gigabytes of disk space. Lite mode requires none of these. Initial installation and model loading take time, so the default HTTP timeout is 60 seconds.
+The Voice Pack requires Python 3.12, an NVIDIA GPU with CUDA and bfloat16 support, and several gigabytes of disk space. Lite mode requires none of these. The model loads before the service reports ready; each synthesis waits up to 30 seconds before falling back to SAPI.
 
 The service must:
 
@@ -150,7 +154,7 @@ Example configuration:
     "fallback_provider": "sapi",
     "http": {
       "endpoint": "http://127.0.0.1:17863/synthesize",
-      "timeout_seconds": 60,
+      "timeout_seconds": 30,
       "voice_id": "default"
     }
   }
@@ -220,7 +224,7 @@ Do not run EnableLocalDevelopment for a normal marketplace installation. Source 
 
 - v0.1 supports Windows and Codex only.
 - Stop is a turn-level event, not a reliable project-completion signal.
-- If another Stop hook continues work only after the 15-second grace period, Agent Bell can still announce early; `stop_debounce_seconds` may be raised to at most 120 seconds.
+- If another Stop hook continues work only after the 5-second grace period, Agent Bell can still announce early; `stop_debounce_seconds` may be raised to at most 120 seconds.
 - Failure is conservatively inferred from explicit wording.
 - Titles come from local Codex state and use a safe fallback when unavailable.
 - Custom voices require a separately installed and verified experimental Qwen localhost service and a compatible NVIDIA GPU.

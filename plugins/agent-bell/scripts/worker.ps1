@@ -125,10 +125,29 @@ try {
                     continue
                 }
 
+                $threadSourceProperty = $event.PSObject.Properties["thread_source"]
+                $threadSource = if ($null -ne $threadSourceProperty) { [string]$threadSourceProperty.Value } else { "unknown" }
+                if ([string]$config.notifications.automation_runs -eq "none" -and $threadSource -eq "automation") {
+                    $state = Add-AgentBellHandled -State $state -Key ([string]$event.dedupe_key) -MaxEntries ([int]$config.limits.state_entries)
+                    Write-AgentBellJsonAtomic -Path $statePath -Value $state
+                    Write-AgentBellLog -Path $logPath -Level "info" -Message "Suppressed an automation event." -Data @{
+                        event = [string]$event.kind
+                        decision = "suppressed"
+                        reason = "automation"
+                    } -MaxBytes ([int]$config.limits.log_bytes)
+                    Remove-Item -LiteralPath $processingPath -Force
+                    continue
+                }
+
                 if ([string]$event.kind -in @("complete", "failure")) {
                     $debounceSeconds = [int]$config.stop_debounce_seconds
                     if ($debounceSeconds -gt 0) {
-                        Start-Sleep -Seconds $debounceSeconds
+                        $waitMilliseconds = Get-AgentBellDebounceWaitMilliseconds `
+                            -CapturedAt ([string]$event.captured_at) `
+                            -DebounceSeconds $debounceSeconds
+                        if ($waitMilliseconds -gt 0) {
+                            Start-Sleep -Milliseconds $waitMilliseconds
+                        }
                         $capturedAt = [DateTimeOffset]::Parse([string]$event.captured_at)
                         if (Test-AgentBellLaterSessionActivity -PendingDirectory $pendingDirectory -SessionId ([string]$event.session_id) -CapturedAt $capturedAt -CurrentDedupeKey ([string]$event.dedupe_key)) {
                             Write-AgentBellLog -Path $logPath -Level "info" -Message "Suppressed a Stop candidate after later session activity." -Data @{ event = [string]$event.kind; decision = "suppressed" } -MaxBytes ([int]$config.limits.log_bytes)

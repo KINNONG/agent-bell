@@ -170,7 +170,7 @@ Voice Pack 通过健康检查和合成测试后，再把 Agent Bell 数据目录
     "fallback_provider": "sapi",
     "http": {
       "endpoint": "http://127.0.0.1:17863/synthesize",
-      "timeout_seconds": 60,
+      "timeout_seconds": 30,
       "voice_id": "default"
     }
   }
@@ -184,8 +184,8 @@ Voice Pack 通过健康检查和合成测试后，再把 Agent Bell 数据目录
 
 在 RTX 4060 Ti 8 GB、Python 3.12、PyTorch 2.11.0+cu128 上，7.6 秒测试播报的
 冷启动模型加载约 20.9 秒、参考 prompt 约 3.9 秒、生成约 22.8 秒，PyTorch 峰值分配
-显存约 2.3 GB。该数据只用于估算，不是不同显卡上的性能承诺；Agent Bell 因此建议把
-HTTP 超时保持在 60 秒。
+显存约 2.3 GB。该数据只用于估算，不是不同显卡上的性能承诺。默认 HTTP 超时为 30 秒，
+以限制异常长生成造成的提醒延迟；较慢显卡可以按需提高到最多 300 秒。
 
 ## 私人音色目录
 

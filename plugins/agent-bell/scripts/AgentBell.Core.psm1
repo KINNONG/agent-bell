@@ -29,7 +29,7 @@ function Get-AgentBellDefaultConfig {
         mode = "always"
         duration_threshold_seconds = 60
         idle_threshold_seconds = 45
-        stop_debounce_seconds = 15
+        stop_debounce_seconds = 5
         max_title_characters = 60
         templates = [pscustomobject][ordered]@{
             complete = "主人，{title} 任务已完成，请回来查看了。"
@@ -44,12 +44,13 @@ function Get-AgentBellDefaultConfig {
             volume = 100
             http = [pscustomobject][ordered]@{
                 endpoint = "http://127.0.0.1:17863/synthesize"
-                timeout_seconds = 60
+                timeout_seconds = 30
                 voice_id = "default"
             }
         }
         notifications = [pscustomobject][ordered]@{
             short_active_turn = "toast"
+            automation_runs = "none"
         }
         limits = [pscustomobject][ordered]@{
             state_entries = 500
@@ -143,6 +144,9 @@ function Get-AgentBellConfig {
     }
     if ([string]$config.notifications.short_active_turn -notin @("toast", "none")) {
         throw "Agent Bell short_active_turn must be toast or none."
+    }
+    if ([string]$config.notifications.automation_runs -notin @("none", "normal")) {
+        throw "Agent Bell automation_runs must be none or normal."
     }
     if ([int]$config.limits.state_entries -lt 1 -or [int]$config.limits.state_entries -gt 10000 -or
         [int]$config.limits.queue_entries -lt 1 -or [int]$config.limits.queue_entries -gt 10000 -or
@@ -317,6 +321,132 @@ function Get-AgentBellSqliteTitle {
     }
 }
 
+function ConvertTo-AgentBellComparablePath {
+    param([string]$Path)
+
+    $pathValue = $Path
+    if ($pathValue.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $pathValue = '\\' + $pathValue.Substring(8)
+    }
+    elseif ($pathValue.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        $pathValue = $pathValue.Substring(4)
+    }
+    return [System.IO.Path]::GetFullPath($pathValue)
+}
+
+function Read-AgentBellFirstUtf8Line {
+    param(
+        [string]$Path,
+        [int]$MaxBytes = 1048576
+    )
+
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    $memory = New-Object System.IO.MemoryStream
+    try {
+        $buffer = New-Object byte[] 8192
+        $lineComplete = $false
+        while ($memory.Length -le $MaxBytes) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) {
+                break
+            }
+            $writeCount = $read
+            for ($index = 0; $index -lt $read; $index++) {
+                if ($buffer[$index] -eq 10) {
+                    $writeCount = $index
+                    $lineComplete = $true
+                    break
+                }
+            }
+            if ($writeCount -gt 0) {
+                $memory.Write($buffer, 0, $writeCount)
+            }
+            if ($memory.Length -gt $MaxBytes) {
+                return $null
+            }
+            if ($lineComplete) {
+                break
+            }
+        }
+        if ($memory.Length -le 0 -or ($memory.Length -ge $MaxBytes -and -not $lineComplete)) {
+            return $null
+        }
+        $line = [System.Text.Encoding]::UTF8.GetString($memory.ToArray()).TrimEnd("`r")
+        if ($line.Length -gt 0 -and $line[0] -eq [char]0xFEFF) {
+            $line = $line.Substring(1)
+        }
+        return $line
+    }
+    finally {
+        $memory.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Get-AgentBellRolloutThreadSource {
+    param(
+        [string]$CodexHome,
+        [string]$SessionId,
+        [string]$TranscriptPath
+    )
+
+    if ($SessionId -notmatch '^[0-9a-fA-F-]{36}$' -or
+        [string]::IsNullOrWhiteSpace($CodexHome) -or
+        [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+        return "unknown"
+    }
+
+    try {
+        $openPath = [System.IO.Path]::GetFullPath($TranscriptPath)
+        $fullPath = ConvertTo-AgentBellComparablePath -Path $TranscriptPath
+        $allowedRoots = @(
+            (Join-Path $CodexHome "sessions"),
+            (Join-Path $CodexHome "archived_sessions")
+        )
+        $insideCodexHistory = $false
+        foreach ($root in $allowedRoots) {
+            $fullRoot = (ConvertTo-AgentBellComparablePath -Path $root).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+            if ($fullPath.StartsWith($fullRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $insideCodexHistory = $true
+                break
+            }
+        }
+        if (-not $insideCodexHistory -or
+            -not [System.IO.Path]::GetFileName($fullPath).EndsWith("-$SessionId.jsonl", [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $openPath -PathType Leaf)) {
+            return "unknown"
+        }
+
+        $line = Read-AgentBellFirstUtf8Line -Path $openPath
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            return "unknown"
+        }
+
+        $metadata = $line | ConvertFrom-Json
+        if ([string](Get-AgentBellProperty -Object $metadata -Name "type") -ne "session_meta") {
+            return "unknown"
+        }
+        $payload = Get-AgentBellProperty -Object $metadata -Name "payload"
+        $metadataSessionId = [string](Get-AgentBellProperty -Object $payload -Name "id")
+        if ([string]::IsNullOrWhiteSpace($metadataSessionId)) {
+            $metadataSessionId = [string](Get-AgentBellProperty -Object $payload -Name "session_id")
+        }
+        if ($metadataSessionId -ne $SessionId) {
+            return "unknown"
+        }
+
+        $threadSource = [string](Get-AgentBellProperty -Object $payload -Name "thread_source")
+        if ($threadSource -in @("user", "automation", "subagent")) {
+            return $threadSource
+        }
+    }
+    catch {
+        # Missing, concurrently moved, or legacy rollout metadata fails open.
+    }
+    return "unknown"
+}
+
 function Get-AgentBellConversationTitle {
     param(
         [string]$CodexHome,
@@ -416,6 +546,7 @@ function Test-AgentBellExplicitFailure {
 function ConvertTo-AgentBellEvent {
     param(
         [Parameter(Mandatory = $true)][object]$Payload,
+        [ValidateSet("user", "automation", "subagent", "unknown")][string]$ThreadSource = "unknown",
         [DateTimeOffset]$CapturedAt = [DateTimeOffset]::UtcNow
     )
 
@@ -461,6 +592,7 @@ function ConvertTo-AgentBellEvent {
         session_id = $sessionId
         turn_id = $turnId
         cwd = [string](Get-AgentBellProperty -Object $Payload -Name "cwd")
+        thread_source = $ThreadSource
         tool_name = $toolName
         stop_hook_active = $stopHookActive
         attempt = 0
@@ -525,6 +657,27 @@ function Get-AgentBellTurnDurationSeconds {
     }
     catch {
         return $null
+    }
+}
+
+function Get-AgentBellDebounceWaitMilliseconds {
+    param(
+        [string]$CapturedAt,
+        [int]$DebounceSeconds,
+        [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow
+    )
+
+    if ($DebounceSeconds -le 0) {
+        return 0
+    }
+    try {
+        $captured = [DateTimeOffset]::Parse($CapturedAt)
+        $elapsedMilliseconds = [Math]::Max(0, ($Now - $captured).TotalMilliseconds)
+        $maximumMilliseconds = [double]$DebounceSeconds * 1000
+        return [int][Math]::Ceiling([Math]::Max(0, $maximumMilliseconds - [Math]::Min($elapsedMilliseconds, $maximumMilliseconds)))
+    }
+    catch {
+        return $DebounceSeconds * 1000
     }
 }
 
@@ -918,6 +1071,7 @@ Export-ModuleMember -Function @(
     "Write-AgentBellLog",
     "Normalize-AgentBellTitle",
     "ConvertTo-AgentBellTitle",
+    "Get-AgentBellRolloutThreadSource",
     "Get-AgentBellConversationTitle",
     "Test-AgentBellFailureMessage",
     "Test-AgentBellExplicitFailure",
@@ -925,6 +1079,7 @@ Export-ModuleMember -Function @(
     "Get-AgentBellState",
     "Set-AgentBellTurnStart",
     "Get-AgentBellTurnDurationSeconds",
+    "Get-AgentBellDebounceWaitMilliseconds",
     "Test-AgentBellHandled",
     "Add-AgentBellHandled",
     "Get-AgentBellDecision",

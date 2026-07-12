@@ -2,6 +2,7 @@
 param(
     [string]$PluginRoot,
     [string]$DataDir,
+    [string]$CodexHome,
     [string]$TestJson,
     [switch]$NoWorker,
     [switch]$RunWorkerSynchronously,
@@ -38,6 +39,14 @@ try {
             Join-Path $env:LOCALAPPDATA "AgentBell"
         }
     }
+    if ([string]::IsNullOrWhiteSpace($CodexHome)) {
+        $CodexHome = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
+            $env:CODEX_HOME
+        }
+        else {
+            Join-Path $HOME ".codex"
+        }
+    }
 
     $stage = "read_payload"
     $rawPayload = if (-not [string]::IsNullOrWhiteSpace($TestJson)) {
@@ -68,7 +77,13 @@ try {
     Import-Module $modulePath -Force -DisableNameChecking
 
     $stage = "normalize_event"
-    $event = ConvertTo-AgentBellEvent -Payload $payload
+    $transcriptProperty = $payload.PSObject.Properties["transcript_path"]
+    $transcriptPath = if ($null -ne $transcriptProperty) { [string]$transcriptProperty.Value } else { $null }
+    $threadSource = Get-AgentBellRolloutThreadSource `
+        -CodexHome $CodexHome `
+        -SessionId ([string]$payload.session_id) `
+        -TranscriptPath $transcriptPath
+    $event = ConvertTo-AgentBellEvent -Payload $payload -ThreadSource $threadSource
 
     $stage = "enqueue_event"
     $pendingDirectory = Join-Path $DataDir "queue\pending"

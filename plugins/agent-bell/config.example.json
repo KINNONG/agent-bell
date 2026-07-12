@@ -4,7 +4,7 @@
   "mode": "always",
   "duration_threshold_seconds": 60,
   "idle_threshold_seconds": 45,
-  "stop_debounce_seconds": 15,
+  "stop_debounce_seconds": 5,
   "max_title_characters": 60,
   "templates": {
     "complete": "主人，{title} 任务已完成，请回来查看了。",
@@ -19,12 +19,13 @@
     "volume": 100,
     "http": {
       "endpoint": "http://127.0.0.1:17863/synthesize",
-      "timeout_seconds": 60,
+      "timeout_seconds": 30,
       "voice_id": "default"
     }
   },
   "notifications": {
-    "short_active_turn": "toast"
+    "short_active_turn": "toast",
+    "automation_runs": "none"
   },
   "limits": {
     "state_entries": 500,

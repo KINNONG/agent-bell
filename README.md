@@ -18,6 +18,8 @@ Agent Bell 是非官方开源项目，与 OpenAI 没有隶属或背书关系。
 
 UserPromptSubmit Hook 只记录当前回合的开始时间，不会播报，也不会保存用户提示词。
 
+Codex 每日自动化运行默认保持静音，包括完成、失败和等待确认；Agent Bell 根据本地 rollout 的 `thread_source=automation` 判断，不依赖会话名称。手动打开或继续的普通会话仍正常提醒。
+
 默认中文话术：
 
 - 完成：主人，{title} 任务已完成，请回来查看了。
@@ -59,7 +61,7 @@ Lite 模式不需要 Python、GPU、模型文件或 API Key。
 把下面这句话发给 Codex：
 
 ~~~text
-请安装 https://github.com/KINNONG/agent-bell 的 v0.1.1：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.1 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
+请安装 https://github.com/KINNONG/agent-bell 的 v0.1.2：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.2 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
 ~~~
 
 安装过程中有两次必要确认：
@@ -112,11 +114,13 @@ Lite 是公开 v0.1 的默认模式：
 | mode | always | 完成提醒策略 |
 | duration_threshold_seconds | 60 | 达到该运行时长后语音播报 |
 | idle_threshold_seconds | 45 | Windows 空闲达到该时长后语音播报 |
-| stop_debounce_seconds | 15 | 等待其他 Hook 继续任务的防误报窗口 |
+| stop_debounce_seconds | 5 | 等待其他 Hook 继续任务的防误报窗口 |
 | max_title_characters | 60 | 播报标题的最大字符数 |
 | voice.sapi_voice | Microsoft Huihui Desktop | 优先 SAPI 音色 |
 | voice.rate | 0 | SAPI 语速，范围 -10 到 10 |
 | voice.volume | 100 | SAPI 音量，范围 0 到 100 |
+| voice.http.timeout_seconds | 30 | 本地音色超时后回退到 SAPI |
+| notifications.automation_runs | none | 自动化运行保持静音；normal 恢复普通提醒 |
 
 ## 播报策略
 
@@ -133,7 +137,7 @@ Lite 是公开 v0.1 的默认模式：
 
 仓库包含一个可选的实验性 [Qwen Voice Pack](plugins/agent-bell/voice-pack/README.md)。它使用本地 Qwen3-TTS 0.6B Base 模型，从用户明确授权的参考音频生成自定义音色，并实现下面的通用 HTTP 接口。模型、Python 环境和私人音频不会进入插件仓库；服务失败时仍回退到 SAPI。
 
-Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及数 GB 磁盘空间。Lite 模式不需要这些条件。首次安装与模型加载会比较久，因此 HTTP 超时默认是 60 秒。
+Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及数 GB 磁盘空间。Lite 模式不需要这些条件。模型会在服务就绪前完成加载；单次合成默认最多等待 30 秒，超时后立即回退到 SAPI。
 
 服务要求：
 
@@ -150,7 +154,7 @@ Voice Pack 需要 Python 3.12、支持 CUDA 与 bfloat16 的 NVIDIA GPU，以及
     "fallback_provider": "sapi",
     "http": {
       "endpoint": "http://127.0.0.1:17863/synthesize",
-      "timeout_seconds": 60,
+      "timeout_seconds": 30,
       "voice_id": "default"
     }
   }
@@ -220,7 +224,7 @@ UninstallLocalDevelopment 默认保留本地数据。确认不再需要配置、
 
 - v0.1 仅支持 Windows 与 Codex。
 - Stop 是回合级事件，不是可靠的项目完成信号。
-- 多个 Stop Hook 若在 15 秒防误报窗口之后才决定继续任务，仍可能提前播报；可把 `stop_debounce_seconds` 调高到最多 120 秒。
+- 多个 Stop Hook 若在 5 秒防误报窗口之后才决定继续任务，仍可能提前播报；可把 `stop_debounce_seconds` 调高到最多 120 秒。
 - failure 是对明确失败措辞的保守推断。
 - 会话标题来自 Codex 本地状态；读取失败时使用安全回退名称。
 - 自定义音色依赖单独安装并验证的实验性 Qwen localhost 服务，并需要兼容的 NVIDIA GPU。

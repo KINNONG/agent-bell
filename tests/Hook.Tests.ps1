@@ -149,6 +149,64 @@ Describe 'Agent Bell hook queue' {
         $queuedJson | Should Not Match '请检查|请确认|任务已完成|😀'
     }
 
+    It 'suppresses automation events while preserving normal user events' {
+        $config = Get-AgentBellDefaultConfig
+        $config.stop_debounce_seconds = 0
+        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+        $codexHome = Join-Path $script:dataDir 'codex-home'
+        $sessionDirectory = Join-Path $codexHome 'sessions\2026\07\12'
+        New-Item -ItemType Directory -Force -Path $sessionDirectory | Out-Null
+        $cases = @(
+            [ordered]@{
+                id = '12121212-1212-1212-1212-121212121212'
+                source = 'automation'
+            },
+            [ordered]@{
+                id = '34343434-3434-3434-3434-343434343434'
+                source = 'user'
+            }
+        )
+        foreach ($case in $cases) {
+            $transcriptPath = Join-Path $sessionDirectory ("rollout-test-" + $case.id + ".jsonl")
+            $metadata = [ordered]@{
+                type = 'session_meta'
+                payload = [ordered]@{
+                    id = $case.id
+                    source = 'vscode'
+                    thread_source = $case.source
+                    private = 'do not persist this transcript metadata'
+                }
+            } | ConvertTo-Json -Compress -Depth 5
+            [System.IO.File]::WriteAllText($transcriptPath, $metadata + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+            $payload = [ordered]@{
+                hook_event_name = 'Stop'
+                session_id = $case.id
+                turn_id = ('turn-' + $case.source)
+                transcript_path = $transcriptPath
+                cwd = 'C:\work\project'
+                stop_hook_active = $false
+                last_assistant_message = 'Done.'
+            } | ConvertTo-Json -Compress
+            & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -TestJson $payload -NoWorker
+        }
+
+        $queuedJson = @(Get-ChildItem -LiteralPath (Join-Path $script:dataDir 'queue\pending') -Filter '*.json' | ForEach-Object {
+            Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName
+        }) -join [Environment]::NewLine
+        $queuedJson | Should Match '"thread_source"\s*:\s*"automation"'
+        $queuedJson | Should Match '"thread_source"\s*:\s*"user"'
+        $queuedJson | Should Not Match 'transcript_path|do not persist|codex-home'
+
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -DryRun
+
+        $log = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl')
+        $log | Should Match 'Suppressed an automation event'
+        $log | Should Match '"reason":"automation"'
+        @($log -split [Environment]::NewLine | Where-Object { $_ -match 'Processed attention event' }).Count | Should Be 1
+        $log | Should Not Match 'do not persist|codex-home|12121212|34343434'
+    }
+
     It 'reduces a final response to a conservative status' {
         $payload = [ordered]@{
             hook_event_name = 'Stop'

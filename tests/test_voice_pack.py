@@ -65,6 +65,9 @@ class VoicePackHttpContractTests(unittest.TestCase):
         self.assertNotIn("path", payload)
         self.assertNotIn("reference_text", payload)
 
+    def test_generation_has_a_bounded_notification_token_budget(self) -> None:
+        self.assertEqual(SERVER.MAX_NEW_TOKENS, 1_024)
+
     def test_synthesize_returns_wav_and_normalizes_whitespace(self) -> None:
         request = self.request_json(
             "/synthesize", {"text": "  Agent   Bell  ", "voice_id": "default"}

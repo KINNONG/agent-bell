@@ -47,6 +47,15 @@ Describe 'Agent Bell configuration validation' {
 
         { Get-AgentBellConfig -Path $path } | Should Throw
     }
+
+    It 'rejects an unknown automation notification policy' {
+        $config = Get-AgentBellDefaultConfig
+        $config.notifications.automation_runs = 'loud'
+        $path = Join-Path $TestDrive 'invalid-automation-policy.json'
+        Write-AgentBellJsonAtomic -Path $path -Value $config
+
+        { Get-AgentBellConfig -Path $path } | Should Throw
+    }
 }
 
 Describe 'Agent Bell title handling' {
@@ -80,6 +89,57 @@ Describe 'Agent Bell title handling' {
             -FallbackTitle 'Codex'
 
         $actual | Should Be 'Agent Bell 开源版'
+    }
+}
+
+Describe 'Agent Bell Codex thread source detection' {
+    It 'detects automation metadata without using the title or vscode source' {
+        $sessionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        $codexHome = Join-Path $TestDrive 'codex-automation'
+        $sessionDirectory = Join-Path $codexHome 'sessions\2026\07\12'
+        New-Item -ItemType Directory -Force -Path $sessionDirectory | Out-Null
+        $transcriptPath = Join-Path $sessionDirectory "rollout-test-$sessionId.jsonl"
+        $metadata = [ordered]@{
+            type = 'session_meta'
+            payload = [ordered]@{
+                id = $sessionId
+                source = 'vscode'
+                thread_source = 'automation'
+                title = 'a title must not determine notification behavior'
+            }
+        } | ConvertTo-Json -Compress -Depth 5
+        [System.IO.File]::WriteAllText($transcriptPath, $metadata + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+
+        Get-AgentBellRolloutThreadSource -CodexHome $codexHome -SessionId $sessionId -TranscriptPath $transcriptPath |
+            Should Be 'automation'
+    }
+
+    It 'keeps user and untrusted transcript metadata out of the automation bucket' {
+        $sessionId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $codexHome = Join-Path $TestDrive 'codex-user'
+        $sessionDirectory = Join-Path $codexHome 'sessions\2026\07\12'
+        New-Item -ItemType Directory -Force -Path $sessionDirectory | Out-Null
+        $userPath = Join-Path $sessionDirectory "rollout-test-$sessionId.jsonl"
+        $metadata = [ordered]@{
+            type = 'session_meta'
+            payload = [ordered]@{
+                id = $sessionId
+                source = 'vscode'
+                thread_source = 'user'
+            }
+        } | ConvertTo-Json -Compress -Depth 5
+        [System.IO.File]::WriteAllText($userPath, $metadata + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+        $outsidePath = Join-Path $TestDrive "rollout-test-$sessionId.jsonl"
+        [System.IO.File]::WriteAllText($outsidePath, $metadata + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+
+        Get-AgentBellRolloutThreadSource -CodexHome $codexHome -SessionId $sessionId -TranscriptPath $userPath |
+            Should Be 'user'
+        Get-AgentBellRolloutThreadSource -CodexHome $codexHome -SessionId $sessionId -TranscriptPath ('\\?\' + $userPath) |
+            Should Be 'user'
+        Get-AgentBellRolloutThreadSource -CodexHome $codexHome -SessionId $sessionId -TranscriptPath $outsidePath |
+            Should Be 'unknown'
+        Get-AgentBellRolloutThreadSource -CodexHome $codexHome -SessionId 'cccccccc-cccc-cccc-cccc-cccccccccccc' -TranscriptPath $userPath |
+            Should Be 'unknown'
     }
 }
 
@@ -176,6 +236,18 @@ Describe 'Agent Bell Stop continuation handling' {
         $initial.stop_hook_active | Should Be $false
         $continued.stop_hook_active | Should Be $true
         $initial.dedupe_key | Should Not Be $continued.dedupe_key
+    }
+}
+
+Describe 'Agent Bell debounce timing' {
+    It 'waits only for the unexpired part of the debounce window' {
+        $now = [DateTimeOffset]::Parse('2026-07-12T12:00:15Z')
+        Get-AgentBellDebounceWaitMilliseconds -CapturedAt '2026-07-12T12:00:00Z' -DebounceSeconds 5 -Now $now |
+            Should Be 0
+        Get-AgentBellDebounceWaitMilliseconds -CapturedAt '2026-07-12T12:00:12Z' -DebounceSeconds 5 -Now $now |
+            Should Be 2000
+        Get-AgentBellDebounceWaitMilliseconds -CapturedAt 'invalid' -DebounceSeconds 5 -Now $now |
+            Should Be 5000
     }
 }
 
