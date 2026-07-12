@@ -12,7 +12,7 @@ Agent Bell 是非官方开源项目，与 OpenAI 没有隶属或背书关系。
 
 | 状态 | 判断来源 | 默认行为 |
 | --- | --- | --- |
-| 完成 | Codex 的 Stop Hook | 智能判断后语音播报或显示 Windows 通知 |
+| 完成 | Codex 的 Stop Hook | 默认每次语音播报 |
 | 等待确认 | Codex 的 PermissionRequest Hook | 立即语音播报 |
 | 执行遇到问题 | Stop 中最后一条助手消息出现明确失败措辞 | 保守推断后立即语音播报 |
 
@@ -37,7 +37,7 @@ Codex Hook
   -> 清洗并写入最小事件文件
   -> 立即返回，不等待语音
   -> 隐藏的一次性 worker 排队处理
-  -> 解析最新会话名并应用去重与 smart 规则
+  -> 解析最新会话名并应用去重与播报策略
   -> Windows SAPI 或本地 HTTP Voice Pack
   -> HTTP 失败时回退到 SAPI
 ~~~
@@ -59,7 +59,7 @@ Lite 模式不需要 Python、GPU、模型文件或 API Key。
 把下面这句话发给 Codex：
 
 ~~~text
-请安装 https://github.com/KINNONG/agent-bell 的 v0.1.0：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.0 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
+请安装 https://github.com/KINNONG/agent-bell 的 v0.1.1：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.1 和 codex plugin add agent-bell@agent-bell；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
 ~~~
 
 安装过程中有两次必要确认：
@@ -109,7 +109,7 @@ Lite 是公开 v0.1 的默认模式：
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| mode | smart | 完成提醒策略 |
+| mode | always | 完成提醒策略 |
 | duration_threshold_seconds | 60 | 达到该运行时长后语音播报 |
 | idle_threshold_seconds | 45 | Windows 空闲达到该时长后语音播报 |
 | stop_debounce_seconds | 15 | 等待其他 Hook 继续任务的防误报窗口 |
@@ -118,16 +118,16 @@ Lite 是公开 v0.1 的默认模式：
 | voice.rate | 0 | SAPI 语速，范围 -10 到 10 |
 | voice.volume | 100 | SAPI 音量，范围 0 到 100 |
 
-## Smart 模式
+## 播报策略
 
-默认 smart 规则如下：
+默认 `always` 会语音播报每一个 Complete。需要减少短回合打扰时，可以把 `mode` 改为 `smart`，其规则如下：
 
 - Permission 和保守推断的 failure 始终立即语音播报。
 - Complete 在回合运行至少 60 秒时语音播报。
 - Complete 在 Windows 已空闲至少 45 秒时语音播报。
 - 两项都未达到时，只显示 Windows 通知，避免短回合连续打断用户。
 
-把 mode 改为 always，可以让每个 Complete 都语音播报。threshold 模式只使用运行时长阈值。
+`threshold` 模式只使用运行时长阈值。
 
 ## 可选本地 Qwen Voice Pack
 

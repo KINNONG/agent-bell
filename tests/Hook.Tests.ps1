@@ -9,12 +9,16 @@ Import-Module $modulePath -Force -DisableNameChecking
 function Invoke-AgentBellHookProcess {
     param(
         [string]$Payload,
-        [string]$DataDir
+        [string]$DataDir,
+        [switch]$NoWorker
     )
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = 'powershell.exe'
     $startInfo.Arguments = ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -PluginRoot "{1}" -DataDir "{2}"' -f $enqueuePath, $pluginRoot, $DataDir)
+    if ($NoWorker.IsPresent) {
+        $startInfo.Arguments += ' -NoWorker'
+    }
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
@@ -23,8 +27,9 @@ function Invoke-AgentBellHookProcess {
 
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $process = [Diagnostics.Process]::Start($startInfo)
-    $process.StandardInput.Write($Payload)
-    $process.StandardInput.Close()
+    $payloadBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Payload)
+    $process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)
+    $process.StandardInput.BaseStream.Close()
     $stdout = $process.StandardOutput.ReadToEnd()
     $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
@@ -101,6 +106,47 @@ Describe 'Agent Bell hook queue' {
         $startResult.Stdout | Should Be ''
         $startResult.Stderr | Should Be ''
         ($startResult.Milliseconds -lt 2000) | Should Be $true
+    }
+
+    It 'accepts UTF-8 Codex stdin payloads without persisting their private text' {
+        $payloads = @(
+            ([ordered]@{
+                hook_event_name = 'UserPromptSubmit'
+                session_id = '77777777-7777-7777-7777-777777777777'
+                turn_id = 'turn-utf8-start'
+                cwd = 'C:\work\project'
+                prompt = '请检查中文和 emoji 😀'
+            } | ConvertTo-Json -Compress),
+            ([ordered]@{
+                hook_event_name = 'PermissionRequest'
+                session_id = '77777777-7777-7777-7777-777777777777'
+                turn_id = 'turn-utf8-permission'
+                cwd = 'C:\work\project'
+                tool_name = 'Bash'
+                tool_input = @{ description = '请确认中文和 emoji 😀' }
+            } | ConvertTo-Json -Compress -Depth 5),
+            ([ordered]@{
+                hook_event_name = 'Stop'
+                session_id = '77777777-7777-7777-7777-777777777777'
+                turn_id = 'turn-utf8-stop'
+                cwd = 'C:\work\project'
+                stop_hook_active = $false
+                last_assistant_message = '任务已完成 😀'
+            } | ConvertTo-Json -Compress)
+        )
+
+        foreach ($payload in $payloads) {
+            $result = Invoke-AgentBellHookProcess -Payload $payload -DataDir $script:dataDir -NoWorker
+            $result.ExitCode | Should Be 0
+            $result.Stderr | Should Be ''
+        }
+
+        @(Get-ChildItem -LiteralPath (Join-Path $script:dataDir 'queue\pending') -Filter '*.json').Count | Should Be 3
+        Test-Path -LiteralPath (Join-Path $script:dataDir 'logs\hook-errors.log') | Should Be $false
+        $queuedJson = @(Get-ChildItem -LiteralPath (Join-Path $script:dataDir 'queue\pending') -Filter '*.json' | ForEach-Object {
+            Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName
+        }) -join [Environment]::NewLine
+        $queuedJson | Should Not Match '请检查|请确认|任务已完成|😀'
     }
 
     It 'reduces a final response to a conservative status' {

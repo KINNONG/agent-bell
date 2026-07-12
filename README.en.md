@@ -12,7 +12,7 @@ Agent Bell is an unofficial open-source project. It is not affiliated with or en
 
 | State | Source | Default behavior |
 | --- | --- | --- |
-| Complete | Codex Stop hook | Speak or show a Windows notification according to smart mode |
+| Complete | Codex Stop hook | Speak every time by default |
 | Permission required | Codex PermissionRequest hook | Speak immediately |
 | Execution problem | Explicit failure wording in the final Stop message | Conservatively infer failure and speak immediately |
 
@@ -37,7 +37,7 @@ Codex hook
   -> sanitize and atomically enqueue a minimal event
   -> return immediately without waiting for speech
   -> hidden one-shot worker drains the queue
-  -> resolve the latest title, deduplicate, and apply smart mode
+  -> resolve the latest title, deduplicate, and apply the notification policy
   -> Windows SAPI or a localhost HTTP Voice Pack
   -> fall back to SAPI when HTTP synthesis fails
 ~~~
@@ -59,7 +59,7 @@ Lite mode does not require Python, a GPU, model files, or an API key.
 Send this sentence to Codex:
 
 ~~~text
-Install Agent Bell v0.1.0 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.0 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
+Install Agent Bell v0.1.1 from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.1 and codex plugin add agent-bell@agent-bell, then ask me to confirm any required Plugins prompt. Locate the installed plugin root and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
 ~~~
 
 There are two intentional confirmations:
@@ -109,7 +109,7 @@ Common settings:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| mode | smart | Completion notification policy |
+| mode | always | Completion notification policy |
 | duration_threshold_seconds | 60 | Speak after a turn reaches this duration |
 | idle_threshold_seconds | 45 | Speak after Windows reaches this idle duration |
 | stop_debounce_seconds | 15 | Wait for another Stop hook to continue the task before announcing |
@@ -118,16 +118,16 @@ Common settings:
 | voice.rate | 0 | SAPI rate from -10 to 10 |
 | voice.volume | 100 | SAPI volume from 0 to 100 |
 
-## Smart Mode
+## Notification Policies
 
-The default smart policy is:
+The default `always` mode speaks every Complete event. To reduce interruptions from short turns, set `mode` to `smart`; its rules are:
 
 - Permission and conservatively inferred failure events always speak immediately.
 - Complete speaks when the turn ran for at least 60 seconds.
 - Complete speaks when Windows has been idle for at least 45 seconds.
 - Otherwise Complete shows a Windows notification to avoid interrupting the user after every short turn.
 
-Set mode to always to speak every Complete event. Threshold mode considers only turn duration.
+`threshold` mode considers only turn duration.
 
 ## Optional Local Qwen Voice Pack
 

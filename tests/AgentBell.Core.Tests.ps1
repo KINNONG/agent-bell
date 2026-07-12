@@ -101,6 +101,12 @@ Describe 'Agent Bell announcement wording' {
 }
 
 Describe 'Agent Bell smart completion policy' {
+    It 'speaks every completion with the default configuration' {
+        $config = Get-AgentBellDefaultConfig
+        Get-AgentBellDecision -Kind 'complete' -DurationSeconds 0 -IdleSeconds 0 -Config $config |
+            Should Be 'speak'
+    }
+
     It 'uses a Windows notification below both thresholds' {
         Get-AgentBellCompletionAction -DurationSeconds 59.999 -IdleSeconds 44.999 |
             Should Be 'notify'

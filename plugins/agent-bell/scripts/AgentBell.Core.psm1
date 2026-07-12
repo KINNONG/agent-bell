@@ -26,7 +26,7 @@ function Get-AgentBellDefaultConfig {
     return [pscustomobject][ordered]@{
         schema_version = 1
         enabled = $true
-        mode = "smart"
+        mode = "always"
         duration_threshold_seconds = 60
         idle_threshold_seconds = 45
         stop_debounce_seconds = 15

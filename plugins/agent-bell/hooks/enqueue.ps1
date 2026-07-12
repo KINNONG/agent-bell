@@ -15,8 +15,10 @@ $ErrorActionPreference = "Stop"
 $eventName = $null
 $rawPayload = $null
 $writeStopOutput = $false
+$stage = "initialize"
 
 try {
+    $stage = "resolve_paths"
     if ([string]::IsNullOrWhiteSpace($PluginRoot)) {
         $PluginRoot = if (-not [string]::IsNullOrWhiteSpace($env:PLUGIN_ROOT)) {
             $env:PLUGIN_ROOT
@@ -37,25 +39,38 @@ try {
         }
     }
 
+    $stage = "read_payload"
     $rawPayload = if (-not [string]::IsNullOrWhiteSpace($TestJson)) {
         $TestJson
     }
     else {
-        [Console]::In.ReadToEnd()
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $utf8, $true)
+        try {
+            $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
     }
     if ([string]::IsNullOrWhiteSpace($rawPayload)) {
         throw "Agent Bell did not receive a Codex hook payload."
     }
 
+    $stage = "parse_payload"
     $writeStopOutput = $rawPayload -match '"hook_event_name"\s*:\s*"Stop"'
     $payload = $rawPayload | ConvertFrom-Json
     $eventName = [string]$payload.hook_event_name
     $writeStopOutput = $eventName -eq "Stop"
 
+    $stage = "import_module"
     $modulePath = Join-Path $PluginRoot "scripts\AgentBell.Core.psm1"
     Import-Module $modulePath -Force -DisableNameChecking
+
+    $stage = "normalize_event"
     $event = ConvertTo-AgentBellEvent -Payload $payload
 
+    $stage = "enqueue_event"
     $pendingDirectory = Join-Path $DataDir "queue\pending"
     [System.IO.Directory]::CreateDirectory($pendingDirectory) | Out-Null
     $fileName = ([DateTime]::UtcNow.ToString("yyyyMMddHHmmssfffffff") + "-" + [Guid]::NewGuid().ToString("N") + ".json")
@@ -63,6 +78,7 @@ try {
     Write-AgentBellJsonAtomic -Path $eventPath -Value $event
 
     if (-not $NoWorker.IsPresent) {
+        $stage = "launch_worker"
         $workerPath = Join-Path $PluginRoot "scripts\worker.ps1"
         $workerArguments = @(
             "-NoLogo",
@@ -90,7 +106,18 @@ catch {
         $fallbackDataDir = if (-not [string]::IsNullOrWhiteSpace($DataDir)) { $DataDir } else { Join-Path $env:LOCALAPPDATA "AgentBell" }
         $errorDirectory = Join-Path $fallbackDataDir "logs"
         [System.IO.Directory]::CreateDirectory($errorDirectory) | Out-Null
-        $errorLine = ([DateTimeOffset]::UtcNow.ToString("o") + " enqueue_error " + $_.Exception.GetType().Name + [Environment]::NewLine)
+        $exception = $_.Exception
+        $safeEventName = if ($eventName -in @("UserPromptSubmit", "PermissionRequest", "Stop")) { $eventName } else { "unknown" }
+        $parameterName = if ($exception -is [System.ArgumentException] -and
+            -not [string]::IsNullOrWhiteSpace($exception.ParamName) -and
+            $exception.ParamName -match '^[A-Za-z0-9_.-]{1,64}$') { $exception.ParamName } else { "none" }
+        $errorLine = ([DateTimeOffset]::UtcNow.ToString("o") +
+            " enqueue_error stage=" + $stage +
+            " event=" + $safeEventName +
+            " type=" + $exception.GetType().Name +
+            " hresult=0x" + $exception.HResult.ToString("X8") +
+            " param=" + $parameterName +
+            [Environment]::NewLine)
         [System.IO.File]::AppendAllText((Join-Path $errorDirectory "hook-errors.log"), $errorLine)
     }
     catch {
