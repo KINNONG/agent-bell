@@ -16,7 +16,7 @@ Agent Bell 是非官方开源项目，与 OpenAI 没有隶属或背书关系。
 | 等待确认 | Codex 的 PermissionRequest Hook | 立即语音播报 |
 | 执行遇到问题 | Stop 中最后一条助手消息出现明确失败措辞 | 保守推断后立即语音播报 |
 
-UserPromptSubmit Hook 只记录当前回合的开始时间，不会播报，也不会保存用户提示词。启用本地 Voice Pack 时，它还会在独立后台进程中提前准备完成播报，不阻塞 Codex 或主通知队列。
+UserPromptSubmit Hook 只记录当前回合的开始时间，不会播报，也不会保存用户提示词。启用本地 Voice Pack 时，它还会在思考开始时启动独立后台预生成，不阻塞 Codex 或主通知队列。
 
 Codex 每日自动化运行默认保持静音，包括完成、失败和等待确认；Agent Bell 根据本地 rollout 的 `thread_source=automation` 判断，不依赖会话名称。手动打开或继续的普通会话仍正常提醒。
 
@@ -40,9 +40,9 @@ Codex Hook
   -> 立即返回，不等待语音
   -> 隐藏的一次性 worker 排队处理
   -> 解析最新会话名并应用去重与播报策略
-  -> 长任务在执行期间提前生成自定义语音
+  -> 思考开始时立即尝试预生成自定义语音
   -> Windows SAPI 或本地 HTTP Voice Pack
-  -> 完成播报缓存未就绪时立即响提示音
+  -> 自定义语音缓存未就绪时保持静默
 ~~~
 
 插件文件是只读代码。为了让安装脚本与 Hook 始终读取同一份设置，配置、队列、状态、日志和缓存统一位于 `%LOCALAPPDATA%\AgentBell`。可选 Voice Pack 的私人参考音频也应保存在该数据目录，而不是插件源码中。高级用户可以通过 `AGENT_BELL_DATA` 显式覆盖位置。
@@ -62,7 +62,7 @@ Lite 模式不需要 Python、GPU、模型文件或 API Key。
 把下面这句话发给 Codex：
 
 ~~~text
-请以 Lite 模式安装 https://github.com/KINNONG/agent-bell 的 v0.1.4：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.4 和 codex plugin add agent-bell@agent-bell；只安装基础插件，不安装 Qwen Voice Pack、不下载任何模型；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
+请以 Lite 模式安装 https://github.com/KINNONG/agent-bell 的 v0.1.5：先审计仓库，再运行 codex plugin marketplace add KINNONG/agent-bell --ref v0.1.5 和 codex plugin add agent-bell@agent-bell；只安装基础插件，不安装 Qwen Voice Pack、不下载任何模型；让我确认必要的 Plugins 安装提示，定位已安装的插件目录，依次运行 Initialize、Test 和 Doctor；保留我现有的 notify 与其他 hooks，不要绕过 /hooks 的信任确认。
 ~~~
 
 安装过程中有两次必要确认：
@@ -140,17 +140,17 @@ Lite 是公开 v0.1 的默认模式：
 
 这是独立于基础插件的大体积可选安装：预计下载 `5.5–6 GB`，安装后占用约 `7.8 GB`，新安装的目标磁盘必须至少有 `12 GiB`（约 `12.9 GB`）可用空间。最低硬件为 `16 GiB` 系统内存和 `6 GiB` NVIDIA 显存，推荐 `32 GiB` 系统内存和 `8 GiB` 显存，并需要 Python 3.12、CUDA、bfloat16 和计算能力 8.0 或更高版本。Lite 模式不需要其中任何条件，也不会下载模型。
 
-Voice Pack 的模型会在服务就绪前完成加载，并在服务运行期间常驻显存。完成播报的后台预生成会先等待并检查 CPU、内存与 GPU 余量；资源不足或关键指标无法可靠读取时会跳过本次生成，完成时立即响一次提示音，不会阻塞 Codex，也不会稍后补播。生成进程使用较低优先级且队列有界，但仍可能与剪辑、游戏或其他本地 AI 任务争用 GPU；这类工作期间可以继续使用 Lite，或关闭 Voice Pack 服务。权限和失败播报仍使用按需合成，默认最多等待 30 秒后回退到 SAPI。
+Voice Pack 的模型会在服务就绪前完成加载，并在服务运行期间常驻显存。收到 UserPromptSubmit 后，后台进程会立即尝试读取真实会话名；名称已经可用时直接检查 CPU、内存与 GPU 余量并提交预生成，新会话名称尚未写入时会在 10 秒后重试一次。资源不足或关键指标无法可靠读取时会跳过本次生成，完成事件保持静默，不会现场等待合成、稍后补播或播放 Windows 提示音。生成进程使用较低优先级且队列有界，但仍可能与剪辑、游戏或其他本地 AI 任务争用 GPU；这类工作期间可以继续使用 Lite，或关闭 Voice Pack 服务。权限和失败播报仍使用按需合成，默认最多等待 30 秒后回退到 SAPI。
 
 ### 一句话让 Codex 安装自定义音色
 
 仅在确实需要自定义音色时，把下面这句话中的两个占位符替换为自己的授权资料，再发给 Codex：
 
 ~~~text
-请为 Agent Bell v0.1.4 安装可选的本地 Qwen 自定义音色。开始任何下载或写入前，先向我明确展示并说明：预计下载 5.5–6 GB、安装后占用约 7.8 GB、新安装的目标磁盘必须至少有 12 GiB（约 12.9 GB）可用空间；最低硬件为 16 GiB 系统内存和 6 GiB NVIDIA 显存，推荐 32 GiB 系统内存和 8 GiB 显存。等我明确同意大体积下载后才能继续并传入 -ConfirmLargeDownload。参考音频使用 "<本人拥有或已取得明确授权的音频绝对路径>"，逐字准确台词是 "<与参考音频完全一致的准确台词>"；同时让我确认音色权利后再传入 -ConfirmVoiceRights。请提醒我：参考路径和台词会保留在当前 Codex 会话及工具调用记录中；不要把它们提交到仓库或写入 Agent Bell 日志。请定位并运行已安装插件的 voice-pack\install.ps1，让安装器先完成只读硬件与容量预检，只有通过后才继续下载并安装到空间充足的目录。安装后启动本地服务并验证健康检查与合成，只有通过后才把 provider 改为 http，再运行 Agent Bell Test 和 Doctor；资源不足时保留 SAPI 和提示音回退。
+请为 Agent Bell v0.1.5 安装可选的本地 Qwen 自定义音色。开始任何下载或写入前，先向我明确展示并说明：预计下载 5.5–6 GB、安装后占用约 7.8 GB、新安装的目标磁盘必须至少有 12 GiB（约 12.9 GB）可用空间；最低硬件为 16 GiB 系统内存和 6 GiB NVIDIA 显存，推荐 32 GiB 系统内存和 8 GiB 显存。等我明确同意大体积下载后才能继续并传入 -ConfirmLargeDownload。参考音频使用 "<本人拥有或已取得明确授权的音频绝对路径>"，逐字准确台词是 "<与参考音频完全一致的准确台词>"；同时让我确认音色权利后再传入 -ConfirmVoiceRights。请提醒我：参考路径和台词会保留在当前 Codex 会话及工具调用记录中；不要把它们提交到仓库或写入 Agent Bell 日志。请定位并运行已安装插件的 voice-pack\install.ps1，让安装器先完成只读硬件与容量预检，只有通过后才继续下载并安装到空间充足的目录。安装后启动本地服务并验证健康检查与合成，只有通过后才把 provider 改为 http，再运行 Agent Bell Test 和 Doctor；资源不足时不要绕过安全门槛，权限和失败保留 SAPI 回退，完成缓存未命中保持静默。
 ~~~
 
-当前 v0.1.4 安装器使用固定 revision 的官方 Hugging Face 模型仓库。中国大陆网络访问 Hugging Face 可能较慢；Qwen 官方虽然为大陆用户提供 ModelScope 下载方式，但本版安装器还没有 ModelScope 切换参数。遇到下载条件不佳时应先使用无需模型的 Lite 模式，不要擅自改用未经校验的第三方镜像；后续版本可以增加经过校验的镜像源支持。
+当前 v0.1.5 安装器使用固定 revision 的官方 Hugging Face 模型仓库。中国大陆网络访问 Hugging Face 可能较慢；Qwen 官方虽然为大陆用户提供 ModelScope 下载方式，但本版安装器还没有 ModelScope 切换参数。遇到下载条件不佳时应先使用无需模型的 Lite 模式，不要擅自改用未经校验的第三方镜像；后续版本可以增加经过校验的镜像源支持。
 
 服务要求：
 
@@ -177,7 +177,7 @@ Voice Pack 的模型会在服务就绪前完成加载，并在服务运行期间
 
 ### 从旧版 Voice Pack 升级
 
-`v0.1.3` 引入了 `/prewarm` 与 `/cached` 低延迟播报，`v0.1.4` 进一步限制后台资源占用。仅升级插件不会修改插件目录之外的私人 Voice Pack，因此现有用户还需要升级一次本地运行时。
+`v0.1.3` 引入了 `/prewarm` 与 `/cached` 低延迟播报，`v0.1.4` 进一步限制后台资源占用，`v0.1.5` 改为思考开始时立即尝试预生成。仅从 `v0.1.4` 升级到 `v0.1.5` 不需要再次更新 Voice Pack 运行时；从更早版本升级的用户仍需按下面步骤更新一次。
 
 先关闭当前 Voice Pack，确认 `127.0.0.1:17863` 已不再监听，然后从已安装插件根目录运行：
 
@@ -188,7 +188,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updater -InstallRoot "D
 
 使用默认安装目录时可以省略 `-InstallRoot`。更新器不会终止任何预先存在的进程；它只替换 `server.py`、`start.ps1` 和 `requirements.txt`，不接触 `.venv`、模型或私人音色。更新完成后会隐藏启动服务并验证低延迟协议；若更新失败，会尝试恢复并重启旧运行时。
 
-权限或失败播报遇到服务不可用、超时或无效 WAV 时会回退到 SAPI。完成播报的缓存未命中或服务不可用时只播放 Windows 提示音。只有在 Voice Pack 已单独安装并通过测试后，才把 provider 改为 http。
+权限或失败播报遇到服务不可用、超时或无效 WAV 时会回退到 SAPI。完成播报只读取预生成缓存；缓存未命中或服务不可用时保持静默，不会现场生成、延迟补播或播放 Windows 提示音。只有在 Voice Pack 已单独安装并通过测试后，才把 provider 改为 http。
 
 只使用本人拥有或已取得明确授权的参考音频。Agent Bell 不提供公共音色库，也不会在本地模式中主动上传参考音频。
 
@@ -255,7 +255,7 @@ UninstallLocalDevelopment 默认保留本地数据。确认不再需要配置、
 - failure 是对明确失败措辞的保守推断。
 - 会话标题来自 Codex 本地状态；读取失败时使用安全回退名称。
 - 自定义音色依赖单独安装并验证的实验性 Qwen localhost 服务，并需要兼容的 NVIDIA GPU。
-- 第一次出现的新会话名称若尚未写入 Codex 本地状态，或任务短于预生成时间，完成时只播放提示音；后续同名播报可复用内存缓存。
+- 新会话名称尚未写入 Codex 本地状态时会在 10 秒后重试一次；任务短于生成时间、标题后来改变或资源门槛未通过时，本次完成播报可能保持静默。
 - Agent Bell 不是任务结果验证器，也不替代测试、日志或人工验收。
 
 ## 许可证
