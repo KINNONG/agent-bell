@@ -16,7 +16,7 @@ Agent Bell is an unofficial open-source project. It is not affiliated with or en
 | Permission required | Codex PermissionRequest hook | Speak immediately |
 | Execution problem | Explicit failure wording in the final Stop message | Conservatively infer failure and speak immediately |
 
-The UserPromptSubmit hook records only the start time of the turn. It does not speak or persist the user prompt. With the local Voice Pack enabled, it also prepares completion audio in a separate background process without blocking Codex or the main notification queue.
+The UserPromptSubmit hook records only the start time of the turn. It does not speak or persist the user prompt. With the local Voice Pack enabled, it also starts completion preparation when thinking begins, without blocking Codex or the main notification queue.
 
 Scheduled Codex automation runs are silent by default, including completion, failure, and permission events. Agent Bell uses the local rollout's `thread_source=automation` metadata rather than guessing from the title. Normal user-started or resumed threads still notify.
 
@@ -40,9 +40,9 @@ Codex hook
   -> return immediately without waiting for speech
   -> hidden one-shot worker drains the queue
   -> resolve the latest title, deduplicate, and apply the notification policy
-  -> pre-generate custom completion audio while long tasks run
+  -> immediately attempt custom completion pre-generation when thinking begins
   -> Windows SAPI or a localhost HTTP Voice Pack
-  -> play one prompt sound when completion audio is not ready
+  -> stay silent when custom completion audio is not ready
 ~~~
 
 Plugin files contain read-only code. To ensure setup commands and hooks always read the same settings, configuration, queue files, state, logs, and cache live under `%LOCALAPPDATA%\AgentBell`. Private reference audio for an optional Voice Pack should also stay there, never in plugin source. Advanced users may override the location with `AGENT_BELL_DATA`.
@@ -62,7 +62,7 @@ Lite mode does not require Python, a GPU, model files, or an API key.
 Send this sentence to Codex:
 
 ~~~text
-Install Agent Bell v0.1.4 in Lite mode from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.4 and codex plugin add agent-bell@agent-bell, and install only the base plugin: do not install the Qwen Voice Pack or download any model. Ask me to confirm any required Plugins prompt, locate the installed plugin root, and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
+Install Agent Bell v0.1.5 in Lite mode from https://github.com/KINNONG/agent-bell. Audit the repository, run codex plugin marketplace add KINNONG/agent-bell --ref v0.1.5 and codex plugin add agent-bell@agent-bell, and install only the base plugin: do not install the Qwen Voice Pack or download any model. Ask me to confirm any required Plugins prompt, locate the installed plugin root, and run Initialize, Test, and Doctor. Preserve my existing notify configuration and unrelated hooks, and do not bypass the /hooks trust review.
 ~~~
 
 There are two intentional confirmations:
@@ -140,17 +140,17 @@ The repository includes an optional experimental [Qwen Voice Pack](plugins/agent
 
 This is a large, separate, optional installation: expect a `5.5–6 GB` download and approximately `7.8 GB` installed, with at least `12 GiB` (about `12.9 GB`) free on the destination drive before a new installation. The hardware minimum is `16 GiB` of system RAM and `6 GiB` of NVIDIA VRAM; `32 GiB` of RAM and `8 GiB` of VRAM are recommended. Python 3.12, CUDA, bfloat16, and compute capability 8.0 or newer are also required. Lite mode requires none of these and downloads no model.
 
-The model loads before the Voice Pack becomes ready and remains resident in VRAM while the service runs. Background completion preparation waits and checks CPU, RAM, and GPU headroom first. If resources are insufficient or critical metrics cannot be read reliably, Agent Bell skips that generation and plays one prompt sound at completion without blocking Codex or replaying the announcement later. The generation process uses lower priority and a bounded queue, but it can still contend with video editors, games, or other local AI workloads; use Lite or stop the Voice Pack service during such work. Permission and failure announcements still use on-demand synthesis with a 30-second timeout and SAPI fallback.
+The model loads before the Voice Pack becomes ready and remains resident in VRAM while the service runs. After UserPromptSubmit, the background helper immediately tries to resolve the real title. If it is already available, the helper checks CPU, RAM, and GPU headroom and submits preparation at once; if a new title has not been written yet, it retries once after 10 seconds. If resources are insufficient or critical metrics cannot be read reliably, Agent Bell skips that generation and leaves the completion silent without live synthesis, delayed replay, or a Windows prompt sound. The generation process uses lower priority and a bounded queue, but it can still contend with video editors, games, or other local AI workloads; use Lite or stop the Voice Pack service during such work. Permission and failure announcements still use on-demand synthesis with a 30-second timeout and SAPI fallback.
 
 ### One-Sentence Custom-Voice Installation
 
 Only when a custom voice is needed, replace the two placeholders below with authorized material and send the sentence to Codex:
 
 ~~~text
-Install the optional local Qwen custom voice for Agent Bell v0.1.4. Before any download or write, show me and explain that the expected download is 5.5–6 GB, the installed size is approximately 7.8 GB, and a new installation requires at least 12 GiB (about 12.9 GB) free on the destination drive. Explain that the hardware minimum is 16 GiB of system RAM and 6 GiB of NVIDIA VRAM, while 32 GiB of RAM and 8 GiB of VRAM are recommended. Wait for my explicit approval of the large download before continuing or passing -ConfirmLargeDownload. Use "<absolute path to audio that I own or am explicitly authorized to use>" as the reference audio and "<exact word-for-word transcript matching the reference audio>" as its transcript; ask me to confirm the voice rights before passing -ConfirmVoiceRights. Warn me that the reference path and transcript remain visible in this Codex task and its tool-call history; do not commit them to the repository or write them to Agent Bell logs. Locate and run voice-pack\install.ps1 under the installed plugin, let the installer complete its read-only hardware and capacity preflight, and continue downloading and installing to a drive with sufficient space only if that preflight passes. Start the local service after installation and verify its health and synthesis checks; change provider to http only after they pass, then run Agent Bell Test and Doctor. Retain SAPI and prompt-sound fallback when resources are insufficient.
+Install the optional local Qwen custom voice for Agent Bell v0.1.5. Before any download or write, show me and explain that the expected download is 5.5–6 GB, the installed size is approximately 7.8 GB, and a new installation requires at least 12 GiB (about 12.9 GB) free on the destination drive. Explain that the hardware minimum is 16 GiB of system RAM and 6 GiB of NVIDIA VRAM, while 32 GiB of RAM and 8 GiB of VRAM are recommended. Wait for my explicit approval of the large download before continuing or passing -ConfirmLargeDownload. Use "<absolute path to audio that I own or am explicitly authorized to use>" as the reference audio and "<exact word-for-word transcript matching the reference audio>" as its transcript; ask me to confirm the voice rights before passing -ConfirmVoiceRights. Warn me that the reference path and transcript remain visible in this Codex task and its tool-call history; do not commit them to the repository or write them to Agent Bell logs. Locate and run voice-pack\install.ps1 under the installed plugin, let the installer complete its read-only hardware and capacity preflight, and continue downloading and installing to a drive with sufficient space only if that preflight passes. Start the local service after installation and verify its health and synthesis checks; change provider to http only after they pass, then run Agent Bell Test and Doctor. Do not bypass resource protections; retain SAPI fallback for permission and failure announcements, while a completion cache miss stays silent.
 ~~~
 
-The v0.1.4 installer uses the official Hugging Face model repository at a pinned revision. Hugging Face downloads may be slow from Mainland China. Although Qwen documents ModelScope as a download route for Mainland China, this installer does not yet expose a ModelScope switch. Use model-free Lite mode when the download path is unsuitable, and do not substitute an unverified third-party mirror; a future version can add a verified mirror source.
+The v0.1.5 installer uses the official Hugging Face model repository at a pinned revision. Hugging Face downloads may be slow from Mainland China. Although Qwen documents ModelScope as a download route for Mainland China, this installer does not yet expose a ModelScope switch. Use model-free Lite mode when the download path is unsuitable, and do not substitute an unverified third-party mirror; a future version can add a verified mirror source.
 
 The service must:
 
@@ -177,7 +177,7 @@ Example configuration:
 
 ### Upgrading an Existing Voice Pack
 
-`v0.1.3` introduced the `/prewarm` and `/cached` low-latency path, and `v0.1.4` further bounds background resource pressure. A plugin upgrade cannot modify a private Voice Pack installed outside the plugin directory, so existing users must update that local runtime once.
+`v0.1.3` introduced the `/prewarm` and `/cached` low-latency path, `v0.1.4` further bounded background resource pressure, and `v0.1.5` starts preparation as soon as thinking begins. Upgrading from `v0.1.4` to `v0.1.5` does not require another Voice Pack runtime update; users upgrading from an earlier version still need the one-time update below.
 
 Stop the current Voice Pack and confirm that `127.0.0.1:17863` is no longer listening, then run this from the installed plugin root:
 
@@ -188,7 +188,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updater -InstallRoot "D
 
 Omit `-InstallRoot` for the default location. The updater never terminates a pre-existing process. It replaces only `server.py`, `start.ps1`, and `requirements.txt`; it does not touch `.venv`, models, or private voices. It starts the service hidden and verifies the low-latency protocol, and attempts to restore and restart the previous runtime if the update fails.
 
-Permission and failure announcements fall back to SAPI if the service is unavailable, times out, or returns an invalid WAV. A completion cache miss or unavailable service plays one Windows prompt sound. Change provider to http only after the Voice Pack has been installed separately and passed a local test.
+Permission and failure announcements fall back to SAPI if the service is unavailable, times out, or returns an invalid WAV. Completion announcements read only the prepared cache; a miss or unavailable service stays silent, with no live synthesis, delayed replay, or Windows prompt sound. Change provider to http only after the Voice Pack has been installed separately and passed a local test.
 
 Use only reference audio that you own or have explicit permission to use. Agent Bell provides no public voice library and does not upload reference audio in local mode.
 
@@ -255,7 +255,7 @@ Do not run EnableLocalDevelopment for a normal marketplace installation. Source 
 - Failure is conservatively inferred from explicit wording.
 - Titles come from local Codex state and use a safe fallback when unavailable.
 - Custom voices require a separately installed and verified experimental Qwen localhost service and a compatible NVIDIA GPU.
-- A new title that is not yet present in Codex state, or a task shorter than the preparation time, produces one prompt sound on its first completion; later announcements with the same title can reuse the memory cache.
+- A new title that is not yet present in Codex state gets one retry after 10 seconds. A task shorter than generation, a later title change, or a denied resource gate can leave that completion silent.
 - Agent Bell is not a task-result verifier and does not replace tests, logs, or human review.
 
 ## License

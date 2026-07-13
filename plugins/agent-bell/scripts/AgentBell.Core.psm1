@@ -1405,10 +1405,6 @@ function Request-AgentBellCachedVoice {
     }
 }
 
-function Invoke-AgentBellInformationChime {
-    [System.Media.SystemSounds]::Asterisk.Play()
-}
-
 function Invoke-AgentBellHttpCompletion {
     param(
         [Parameter(Mandatory = $true)][string]$Message,
@@ -1425,14 +1421,13 @@ function Invoke-AgentBellHttpCompletion {
         }
     }
     catch {
-        # A cache or playback error falls through to the immediate local chime.
+        # Completion playback stays cache-only and never delays Codex with live synthesis.
     }
     finally {
         Remove-Item -LiteralPath $wavPath -Force -ErrorAction SilentlyContinue
     }
 
-    Invoke-AgentBellInformationChime
-    return "chime"
+    return "http-cache-miss"
 }
 
 function Invoke-AgentBellSpeech {
@@ -1527,7 +1522,6 @@ Export-ModuleMember -Function @(
     "Invoke-AgentBellHttpPrewarm",
     "Request-AgentBellCachedVoice",
     "Invoke-AgentBellWavPlayback",
-    "Invoke-AgentBellInformationChime",
     "Invoke-AgentBellHttpCompletion",
     "Invoke-AgentBellSpeech",
     "Show-AgentBellNotification"

@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DataDir,
     [Parameter(Mandatory = $true)][string]$CodexHome,
     [Parameter(Mandatory = $true)][string]$RequestPath,
-    [ValidateRange(0, 120)][int]$DelaySeconds = 10,
+    [Alias("DelaySeconds")][ValidateRange(0, 120)][int]$TitleRetryDelaySeconds = 10,
     [object]$ResourceSnapshot = $null
 )
 
@@ -87,29 +87,40 @@ try {
         }
     }
 
-    if ($DelaySeconds -gt 0) {
-        Start-Sleep -Seconds $DelaySeconds
-    }
-
-    $config = Get-AgentBellConfig -Path (Join-Path $DataDir "config.json")
-    if (-not [bool]$config.enabled -or [string]$config.voice.provider -ne 'http') {
-        return
-    }
-    if ($threadSource -eq 'automation' -and [string]$config.notifications.automation_runs -eq 'none') {
-        return
-    }
-
     $statePath = Join-Path $DataDir "state\state.json"
     $turnKey = "$sessionId|$turnId"
-    $state = Get-AgentBellState -Path $statePath
-    if (-not (Test-AgentBellTurnActive -State $state -Key $turnKey)) {
-        return
+    $configPath = Join-Path $DataDir "config.json"
+    $title = $null
+    $titleLookupDelays = @([int]0)
+    if ($TitleRetryDelaySeconds -gt 0) {
+        $titleLookupDelays += $TitleRetryDelaySeconds
     }
+    foreach ($titleLookupDelay in $titleLookupDelays) {
+        if ($titleLookupDelay -gt 0) {
+            Start-Sleep -Seconds $titleLookupDelay
+        }
 
-    $title = Get-AgentBellRealConversationTitle `
-        -CodexHome $CodexHome `
-        -SessionId $sessionId `
-        -MaxCharacters ([int]$config.max_title_characters)
+        $config = Get-AgentBellConfig -Path $configPath
+        if (-not [bool]$config.enabled -or [string]$config.voice.provider -ne 'http') {
+            return
+        }
+        if ($threadSource -eq 'automation' -and [string]$config.notifications.automation_runs -eq 'none') {
+            return
+        }
+
+        $state = Get-AgentBellState -Path $statePath
+        if (-not (Test-AgentBellTurnActive -State $state -Key $turnKey)) {
+            return
+        }
+
+        $title = Get-AgentBellRealConversationTitle `
+            -CodexHome $CodexHome `
+            -SessionId $sessionId `
+            -MaxCharacters ([int]$config.max_title_characters)
+        if (-not [string]::IsNullOrWhiteSpace($title)) {
+            break
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($title)) {
         return
     }
@@ -136,11 +147,23 @@ try {
         return
     }
 
-    $config = Get-AgentBellConfig -Path (Join-Path $DataDir "config.json")
+    $config = Get-AgentBellConfig -Path $configPath
     if (-not [bool]$config.enabled -or [string]$config.voice.provider -ne 'http') {
         return
     }
     if ($threadSource -eq 'automation' -and [string]$config.notifications.automation_runs -eq 'none') {
+        return
+    }
+    $state = Get-AgentBellState -Path $statePath
+    if (-not (Test-AgentBellTurnActive -State $state -Key $turnKey)) {
+        return
+    }
+
+    $title = Get-AgentBellRealConversationTitle `
+        -CodexHome $CodexHome `
+        -SessionId $sessionId `
+        -MaxCharacters ([int]$config.max_title_characters)
+    if ([string]::IsNullOrWhiteSpace($title)) {
         return
     }
     $state = Get-AgentBellState -Path $statePath

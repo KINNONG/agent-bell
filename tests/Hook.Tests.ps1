@@ -153,7 +153,7 @@ Describe 'Agent Bell hook queue' {
             -DataDir $script:dataDir `
             -CodexHome (Join-Path $script:dataDir 'codex-home') `
             -RequestPath $outsidePath `
-            -DelaySeconds 0
+            -TitleRetryDelaySeconds 0
 
         Test-Path -LiteralPath $outsidePath -PathType Leaf | Should Be $true
         Get-Content -Raw -Encoding UTF8 -LiteralPath $outsidePath | Should Be '{"private":"keep"}'
@@ -214,7 +214,7 @@ Describe 'Agent Bell hook queue' {
 
     It 'rechecks config and active state after collection before sending HTTP' {
         $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $prewarmPath
-        $pattern = '\$resourceDecision\s*=.*?[\s\S]+?Get-AgentBellConfig[\s\S]+?Get-AgentBellState[\s\S]+?Invoke-AgentBellHttpPrewarm'
+        $pattern = '\$resourceDecision\s*=.*?[\s\S]+?Get-AgentBellConfig[\s\S]+?Get-AgentBellState[\s\S]+?Get-AgentBellRealConversationTitle[\s\S]+?Get-AgentBellState[\s\S]+?Invoke-AgentBellHttpPrewarm'
 
         $source | Should Match $pattern
     }
@@ -267,7 +267,6 @@ Describe 'Agent Bell hook queue' {
                 -DataDir $script:dataDir `
                 -CodexHome $codexHome `
                 -RequestPath $requestPath `
-                -DelaySeconds 0 `
                 -ResourceSnapshot (New-AgentBellAllowedResourceSnapshot)
             $stopwatch.Stop()
 
@@ -285,43 +284,73 @@ Describe 'Agent Bell hook queue' {
         }
     }
 
-    It 'waits ten seconds before looking up an already available title by default' {
-        $config = Get-AgentBellDefaultConfig
-        $config.voice.provider = 'http'
-        $config.voice.http.endpoint = 'http://127.0.0.1:9/synthesize'
-        $config.voice.http.timeout_seconds = 1
-        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+    It 'retries once when a new Codex title appears during the grace period' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 202 -ContentType 'application/json' -ResponseBody $responseBody
+        $titleWriter = $null
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
 
-        $sessionId = '58585858-5858-5858-5858-585858585858'
-        $turnId = 'turn-default-delay'
-        $codexHome = Join-Path $script:dataDir 'codex-home'
-        New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
-        $titleRow = [ordered]@{ id = $sessionId; thread_name = '已经存在的标题' } | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
-        $state = Set-AgentBellTurnStart -State (Get-AgentBellState) -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
-        Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
-        $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
-        New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
-        $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
-        Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
-            schema_version = 1
-            session_id = $sessionId
-            turn_id = $turnId
-            thread_source = 'user'
-        })
+            $sessionId = '58585858-5858-5858-5858-585858585858'
+            $turnId = 'turn-title-retry'
+            $codexHome = Join-Path $script:dataDir 'codex-home'
+            New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+            $indexPath = Join-Path $codexHome 'session_index.jsonl'
+            $writerReadyPath = Join-Path $script:dataDir 'title-writer-ready'
+            $titleRow = [ordered]@{ id = $sessionId; thread_name = '稍后出现的标题' } | ConvertTo-Json -Compress
+            $titleWriter = Start-Job -ArgumentList $indexPath, $titleRow, $writerReadyPath -ScriptBlock {
+                param($Path, $Row, $ReadyPath)
+                [System.IO.File]::WriteAllText($ReadyPath, 'ready', (New-Object System.Text.UTF8Encoding($false)))
+                Start-Sleep -Seconds 2
+                [System.IO.File]::WriteAllText($Path, $Row + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+            }
+            $writerDeadline = (Get-Date).AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $writerReadyPath) -and (Get-Date) -lt $writerDeadline) {
+                Start-Sleep -Milliseconds 50
+            }
+            Test-Path -LiteralPath $writerReadyPath | Should Be $true
+            $state = Set-AgentBellTurnStart -State (Get-AgentBellState) -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+            $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+            New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+            $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+            Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+                schema_version = 1
+                session_id = $sessionId
+                turn_id = $turnId
+                thread_source = 'user'
+            })
 
-        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-        & $prewarmPath `
-            -PluginRoot $pluginRoot `
-            -DataDir $script:dataDir `
-            -CodexHome $codexHome `
-            -RequestPath $requestPath `
-            -ResourceSnapshot (New-AgentBellAllowedResourceSnapshot)
-        $stopwatch.Stop()
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            & $prewarmPath `
+                -PluginRoot $pluginRoot `
+                -DataDir $script:dataDir `
+                -CodexHome $codexHome `
+                -RequestPath $requestPath `
+                -TitleRetryDelaySeconds 3 `
+                -ResourceSnapshot (New-AgentBellAllowedResourceSnapshot)
+            $stopwatch.Stop()
 
-        ($stopwatch.ElapsedMilliseconds -ge 9500) | Should Be $true
-        ($stopwatch.ElapsedMilliseconds -lt 15000) | Should Be $true
-        Test-Path -LiteralPath $requestPath | Should Be $false
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $payload = $result.body | ConvertFrom-Json
+            $result.path | Should Be '/prewarm'
+            $payload.text | Should Be '主人，稍后出现的标题 任务已完成，请回来查看了。'
+            ($stopwatch.ElapsedMilliseconds -ge 2800) | Should Be $true
+            ($stopwatch.ElapsedMilliseconds -lt 5000) | Should Be $true
+            Test-Path -LiteralPath $requestPath | Should Be $false
+        }
+        finally {
+            if ($null -ne $titleWriter) {
+                Stop-Job -Job $titleWriter -ErrorAction SilentlyContinue
+                Remove-Job -Job $titleWriter -Force -ErrorAction SilentlyContinue
+            }
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'skips denied resource snapshots without HTTP or private log data' {
@@ -360,7 +389,6 @@ Describe 'Agent Bell hook queue' {
                 -DataDir $script:dataDir `
                 -CodexHome $codexHome `
                 -RequestPath $requestPath `
-                -DelaySeconds 0 `
                 -ResourceSnapshot $deniedSnapshot
 
             $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
@@ -404,7 +432,7 @@ Describe 'Agent Bell hook queue' {
         })
 
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-        & $prewarmPath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -RequestPath $requestPath -DelaySeconds 0
+        & $prewarmPath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -RequestPath $requestPath
         $stopwatch.Stop()
 
         ($stopwatch.ElapsedMilliseconds -lt 1000) | Should Be $true
@@ -464,6 +492,79 @@ Describe 'Agent Bell hook queue' {
             $hit | Should Be $false
             ($stopwatch.ElapsedMilliseconds -lt 3000) | Should Be $true
             Test-Path -LiteralPath $outputPath | Should Be $false
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'keeps an HTTP completion cache miss silent without a Windows system sound' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"cache_miss"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 404 -ContentType 'application/json' -ResponseBody $responseBody
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            $cacheDirectory = Join-Path $script:dataDir 'cache'
+
+            $provider = Invoke-AgentBellHttpCompletion `
+                -Message '主人，静默缓存测试 任务已完成，请回来查看了。' `
+                -Config $config `
+                -CacheDirectory $cacheDirectory
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $modulePath
+
+            $provider | Should Be 'http-cache-miss'
+            $result.path | Should Be '/cached'
+            @(Get-ChildItem -LiteralPath $cacheDirectory -Filter '*.wav' -File -ErrorAction SilentlyContinue).Count | Should Be 0
+            $source | Should Not Match 'SystemSounds'
+            $source | Should Not Match 'Invoke-AgentBellInformationChime'
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'logs a silent worker cache miss without private task metadata' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"cache_miss"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 404 -ContentType 'application/json' -ResponseBody $responseBody
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.stop_debounce_seconds = 0
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+            $sessionId = '61616161-6161-6161-6161-616161616161'
+            $turnId = 'private-silent-cache-turn'
+            $privateTitle = '静默缓存隐私会话'
+            $codexHome = Join-Path $script:dataDir 'codex-home'
+            New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+            $titleRow = [ordered]@{ id = $sessionId; thread_name = $privateTitle } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+            $payload = [ordered]@{
+                hook_event_name = 'Stop'
+                session_id = $sessionId
+                turn_id = $turnId
+                cwd = 'C:\work\private-silent-cache'
+                stop_hook_active = $false
+                last_assistant_message = 'Done.'
+            } | ConvertTo-Json -Compress
+
+            & $enqueuePath -PluginRoot $pluginRoot -DataDir $script:dataDir -CodexHome $codexHome -TestJson $payload -NoWorker
+            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $workerPath -DataDir $script:dataDir -PluginRoot $pluginRoot -CodexHome $codexHome
+
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $log = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl')
+            $result.path | Should Be '/cached'
+            $log | Should Match '"provider":"http-cache-miss"'
+            $log | Should Not Match ([regex]::Escape($privateTitle))
+            $log | Should Not Match ([regex]::Escape($sessionId))
+            $log | Should Not Match ([regex]::Escape($turnId))
         }
         finally {
             Stop-Job -Job $server -ErrorAction SilentlyContinue
