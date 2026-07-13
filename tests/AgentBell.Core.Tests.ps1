@@ -386,7 +386,7 @@ Describe 'Agent Bell local voice boundary' {
 Describe 'Agent Bell prewarm resource policy' {
     BeforeEach {
         $script:healthyResourceSnapshot = [pscustomobject]@{
-            available_memory_bytes   = 2GB
+            available_memory_bytes   = 1536MB
             cpu_percent              = 75
             free_gpu_memory_mib      = 1536
             gpu_utilization_percent  = 70
@@ -400,8 +400,8 @@ Describe 'Agent Bell prewarm resource policy' {
         $decision.reason | Should Be 'ready'
     }
 
-    It 'denies available memory below two GiB' {
-        $script:healthyResourceSnapshot.available_memory_bytes = 2GB - 1
+    It 'denies available memory below one and a half GiB' {
+        $script:healthyResourceSnapshot.available_memory_bytes = 1536MB - 1
 
         $decision = Get-AgentBellPrewarmResourceDecision -Snapshot $script:healthyResourceSnapshot
 
@@ -465,6 +465,16 @@ Describe 'Agent Bell prewarm resource policy' {
         ($same -join ',') | Should Be ($first -join ',')
         ($other -join ',') | Should Not Be ($first -join ',')
         ($first -join ',') | Should Not Match ([regex]::Escape('agent-bell\one'))
+    }
+
+    It 'bounds deferred prewarm helpers with four separate privacy-safe slots' {
+        $waiters = @(Get-AgentBellPrewarmWaiterSlotNames -DataDir 'C:\agent-bell\one')
+        $active = @(Get-AgentBellPrewarmSlotNames -DataDir 'C:\agent-bell\one')
+
+        $waiters.Count | Should Be 4
+        @($waiters | Select-Object -Unique).Count | Should Be 4
+        ($waiters -join ',') | Should Match '^Local\\AgentBellPrewarmWaiter-[0-9a-f]{64}-0,Local\\AgentBellPrewarmWaiter-[0-9a-f]{64}-1,Local\\AgentBellPrewarmWaiter-[0-9a-f]{64}-2,Local\\AgentBellPrewarmWaiter-[0-9a-f]{64}-3$'
+        @($waiters | Where-Object { $active -contains $_ }).Count | Should Be 0
     }
 
     It 'bounds every external resource probe to about two seconds' {

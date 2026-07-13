@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$CodexHome,
     [Parameter(Mandatory = $true)][string]$RequestPath,
     [Alias("DelaySeconds")][ValidateRange(0, 120)][int]$TitleRetryDelaySeconds = 10,
-    [object]$ResourceSnapshot = $null
+    [object]$ResourceSnapshot = $null,
+    [ValidateRange(0, 120)][int[]]$ResourceRetryDelaysSeconds = @(15, 30, 30)
 )
 
 Set-StrictMode -Version 2.0
@@ -42,8 +43,24 @@ function Enter-AgentBellPrewarmSlot {
     return $null
 }
 
+function Close-AgentBellPrewarmSlot {
+    param([object]$Slot)
+
+    if ($null -eq $Slot) {
+        return
+    }
+    try {
+        $Slot.ReleaseMutex()
+    }
+    catch {
+        # Slot cleanup is best-effort during helper shutdown.
+    }
+    $Slot.Dispose()
+}
+
 $requestFile = $null
 $prewarmSlot = $null
+$waiterSlot = $null
 try {
     $modulePath = Join-Path $PluginRoot "scripts\AgentBell.Core.psm1"
     Import-Module $modulePath -Force -DisableNameChecking
@@ -57,11 +74,6 @@ try {
         return
     }
     $requestFile = $requestFullPath
-
-    $prewarmSlot = Enter-AgentBellPrewarmSlot -SlotNames @(Get-AgentBellPrewarmSlotNames -DataDir $DataDir)
-    if ($null -eq $prewarmSlot) {
-        return
-    }
 
     $requestItem = Get-Item -LiteralPath $requestFullPath
     if ($requestItem.Length -le 0 -or $requestItem.Length -gt 8192) {
@@ -85,6 +97,11 @@ try {
         if ([char]::IsControl($character)) {
             return
         }
+    }
+
+    $waiterSlot = Enter-AgentBellPrewarmSlot -SlotNames @(Get-AgentBellPrewarmWaiterSlotNames -DataDir $DataDir)
+    if ($null -eq $waiterSlot) {
+        return
     }
 
     $statePath = Join-Path $DataDir "state\state.json"
@@ -130,19 +147,65 @@ try {
         return
     }
 
-    $snapshot = if ($null -ne $ResourceSnapshot) {
-        $ResourceSnapshot
+    $injectedSnapshots = @()
+    if ($null -ne $ResourceSnapshot) {
+        $injectedSnapshots = @($ResourceSnapshot)
     }
-    else {
-        Get-AgentBellResourceSnapshot
+    $resourceRetrySchedule = @([int]0) + @($ResourceRetryDelaysSeconds)
+    $resourceDecision = $null
+    $lastResourceAttempt = 0
+    for ($resourceIndex = 0; $resourceIndex -lt $resourceRetrySchedule.Count; $resourceIndex++) {
+        $resourceDelay = [int]$resourceRetrySchedule[$resourceIndex]
+        if ($resourceDelay -gt 0) {
+            Start-Sleep -Seconds $resourceDelay
+        }
+
+        $config = Get-AgentBellConfig -Path $configPath
+        if (-not [bool]$config.enabled -or [string]$config.voice.provider -ne 'http') {
+            return
+        }
+        if ($threadSource -eq 'automation' -and [string]$config.notifications.automation_runs -eq 'none') {
+            return
+        }
+        $state = Get-AgentBellState -Path $statePath
+        if (-not (Test-AgentBellTurnActive -State $state -Key $turnKey)) {
+            return
+        }
+
+        $slotDeadline = [DateTimeOffset]::UtcNow.AddSeconds(3)
+        do {
+            $prewarmSlot = Enter-AgentBellPrewarmSlot -SlotNames @(Get-AgentBellPrewarmSlotNames -DataDir $DataDir)
+            if ($null -eq $prewarmSlot -and [DateTimeOffset]::UtcNow -lt $slotDeadline) {
+                Start-Sleep -Milliseconds 250
+            }
+        } while ($null -eq $prewarmSlot -and [DateTimeOffset]::UtcNow -lt $slotDeadline)
+
+        if ($null -eq $prewarmSlot) {
+            $resourceDecision = [pscustomobject][ordered]@{ allowed = $false; reason = "helper_busy" }
+            $lastResourceAttempt = $resourceIndex + 1
+            continue
+        }
+
+        $snapshot = if ($injectedSnapshots.Count -gt 0) {
+            $injectedSnapshots[[Math]::Min($resourceIndex, $injectedSnapshots.Count - 1)]
+        }
+        else {
+            Get-AgentBellResourceSnapshot
+        }
+        $resourceDecision = Get-AgentBellPrewarmResourceDecision -Snapshot $snapshot
+        $lastResourceAttempt = $resourceIndex + 1
+        if ([bool]$resourceDecision.allowed) {
+            break
+        }
+        Close-AgentBellPrewarmSlot -Slot $prewarmSlot
+        $prewarmSlot = $null
     }
-    $resourceDecision = Get-AgentBellPrewarmResourceDecision -Snapshot $snapshot
     if (-not [bool]$resourceDecision.allowed) {
         Write-AgentBellLog `
             -Path (Join-Path $DataDir "logs\agent-bell.jsonl") `
             -Level "info" `
             -Message "Skipped custom voice prewarm" `
-            -Data @{ reason = [string]$resourceDecision.reason } `
+            -Data @{ reason = [string]$resourceDecision.reason; attempt = $lastResourceAttempt } `
             -MaxBytes ([int64]$config.limits.log_bytes)
         return
     }
@@ -172,7 +235,13 @@ try {
     }
 
     $announcement = Get-AgentBellAnnouncement -Kind 'complete' -Title $title -Config $config
-    Invoke-AgentBellHttpPrewarm -Message $announcement -Config $config | Out-Null
+    $accepted = Invoke-AgentBellHttpPrewarm -Message $announcement -Config $config
+    Write-AgentBellLog `
+        -Path (Join-Path $DataDir "logs\agent-bell.jsonl") `
+        -Level "info" `
+        -Message "Requested custom voice prewarm" `
+        -Data @{ status = $(if ($accepted) { "accepted" } else { "rejected" }); attempt = $lastResourceAttempt } `
+        -MaxBytes ([int64]$config.limits.log_bytes)
 }
 catch {
     # Prewarming is best-effort and must never affect Codex or the main worker.
@@ -182,13 +251,10 @@ finally {
         Remove-Item -LiteralPath $requestFile -Force -ErrorAction SilentlyContinue
     }
     if ($null -ne $prewarmSlot) {
-        try {
-            $prewarmSlot.ReleaseMutex()
-        }
-        catch {
-            # Slot cleanup is best-effort during helper shutdown.
-        }
-        $prewarmSlot.Dispose()
+        Close-AgentBellPrewarmSlot -Slot $prewarmSlot
+    }
+    if ($null -ne $waiterSlot) {
+        Close-AgentBellPrewarmSlot -Slot $waiterSlot
     }
 }
 

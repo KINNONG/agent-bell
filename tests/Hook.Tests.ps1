@@ -57,7 +57,7 @@ function Get-AgentBellTestPort {
 
 function New-AgentBellAllowedResourceSnapshot {
     return [pscustomobject]@{
-        available_memory_bytes  = 2GB
+        available_memory_bytes  = 1536MB
         cpu_percent             = 75
         free_gpu_memory_mib     = 1536
         gpu_utilization_percent = 70
@@ -159,57 +159,19 @@ Describe 'Agent Bell hook queue' {
         Get-Content -Raw -Encoding UTF8 -LiteralPath $outsidePath | Should Be '{"private":"keep"}'
     }
 
-    It 'drops a ticket immediately when both data-directory helper slots are occupied' {
-        $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
-        New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
-        $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
-        [System.IO.File]::WriteAllText($requestPath, '{"private":"ticket"}', (New-Object System.Text.UTF8Encoding($false)))
-        $holders = @()
-        try {
-            foreach ($slotName in @(Get-AgentBellPrewarmSlotNames -DataDir $script:dataDir)) {
-                $holders += Start-Job -ArgumentList $slotName -ScriptBlock {
-                    param($Name)
-                    $mutex = New-Object System.Threading.Mutex($false, $Name)
-                    $owned = $false
-                    try {
-                        $owned = $mutex.WaitOne(0)
-                        [pscustomobject]@{ ready = $owned }
-                        Start-Sleep -Seconds 10
-                    }
-                    finally {
-                        if ($owned) {
-                            $mutex.ReleaseMutex()
-                        }
-                        $mutex.Dispose()
-                    }
-                }
-            }
-            $deadline = (Get-Date).AddSeconds(5)
-            do {
-                $readyCount = @($holders | Where-Object {
-                    @((Receive-Job -Job $_ -Keep -ErrorAction SilentlyContinue) | Where-Object { $_.ready }).Count -gt 0
-                }).Count
-                if ($readyCount -lt 2) {
-                    Start-Sleep -Milliseconds 100
-                }
-            } while ($readyCount -lt 2 -and (Get-Date) -lt $deadline)
-            $readyCount | Should Be 2
+    It 'releases a denied helper slot before waiting for the next resource attempt' {
+        $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $prewarmPath
 
-            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-            & $prewarmPath `
-                -PluginRoot $pluginRoot `
-                -DataDir $script:dataDir `
-                -CodexHome (Join-Path $script:dataDir 'codex-home') `
-                -RequestPath $requestPath
-            $stopwatch.Stop()
+        $source | Should Match 'if \(\[bool\]\$resourceDecision\.allowed\)\s*\{\s*break\s*\}\s*Close-AgentBellPrewarmSlot -Slot \$prewarmSlot\s*\$prewarmSlot = \$null'
+    }
 
-            ($stopwatch.ElapsedMilliseconds -lt 2000) | Should Be $true
-            Test-Path -LiteralPath $requestPath | Should Be $false
-        }
-        finally {
-            $holders | Stop-Job -ErrorAction SilentlyContinue
-            $holders | Remove-Job -Force -ErrorAction SilentlyContinue
-        }
+    It 'caps deferred prewarm helpers independently from active resource slots' {
+        $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $prewarmPath
+
+        $source | Should Match '\$ResourceRetryDelaysSeconds\s*=\s*@\(15,\s*30,\s*30\)'
+        $source | Should Match 'Get-AgentBellPrewarmWaiterSlotNames'
+        $source | Should Match 'if \(\$null -eq \$waiterSlot\)\s*\{\s*return\s*\}'
+        $source | Should Match 'Close-AgentBellPrewarmSlot -Slot \$waiterSlot'
     }
 
     It 'rechecks config and active state after collection before sending HTTP' {
@@ -382,20 +344,84 @@ Describe 'Agent Bell hook queue' {
                 thread_source = 'user'
             })
             $deniedSnapshot = New-AgentBellAllowedResourceSnapshot
-            $deniedSnapshot.available_memory_bytes = 2GB - 1
+            $deniedSnapshot.available_memory_bytes = 1536MB - 1
 
             & $prewarmPath `
                 -PluginRoot $pluginRoot `
                 -DataDir $script:dataDir `
                 -CodexHome $codexHome `
                 -RequestPath $requestPath `
-                -ResourceSnapshot $deniedSnapshot
+                -ResourceSnapshot $deniedSnapshot `
+                -ResourceRetryDelaysSeconds 0
 
             $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
             $result.received | Should Be $false
             $entry = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl') | ConvertFrom-Json
-            (($entry.data.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') | Should Be 'reason'
+            (($entry.data.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') | Should Be 'reason,attempt'
             $entry.data.reason | Should Be 'memory_low'
+            $entry.data.attempt | Should Be 2
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($privateTitle))
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($sessionId))
+            ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($turnId))
+        }
+        finally {
+            Stop-Job -Job $server -ErrorAction SilentlyContinue
+            Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'retries a denied resource snapshot and prewarms after headroom recovers' {
+        $port = Get-AgentBellTestPort
+        $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
+        $server = Start-AgentBellTestServer -Port $port -StatusCode 202 -ContentType 'application/json' -ResponseBody $responseBody
+        try {
+            $config = Get-AgentBellDefaultConfig
+            $config.voice.provider = 'http'
+            $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
+
+            $sessionId = '62626262-6262-6262-6262-626262626262'
+            $turnId = 'turn-resource-recovery'
+            $privateTitle = '资源恢复测试会话'
+            $codexHome = Join-Path $script:dataDir 'codex-home'
+            New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+            $titleRow = [ordered]@{ id = $sessionId; thread_name = $privateTitle } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText((Join-Path $codexHome 'session_index.jsonl'), $titleRow + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+            $state = Set-AgentBellTurnStart -State (Get-AgentBellState) -Key "$sessionId|$turnId" -CapturedAt '2026-07-13T00:00:00Z'
+            Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'state\state.json') -Value $state
+            $requestDirectory = Join-Path $script:dataDir 'queue\prewarm'
+            New-Item -ItemType Directory -Force -Path $requestDirectory | Out-Null
+            $requestPath = Join-Path $requestDirectory ('prewarm-' + [guid]::NewGuid().ToString('N') + '.json')
+            Write-AgentBellJsonAtomic -Path $requestPath -Value ([ordered]@{
+                schema_version = 1
+                session_id = $sessionId
+                turn_id = $turnId
+                thread_source = 'user'
+            })
+            $deniedSnapshot = New-AgentBellAllowedResourceSnapshot
+            $deniedSnapshot.cpu_percent = 76
+            $recoveredSnapshot = New-AgentBellAllowedResourceSnapshot
+
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            & $prewarmPath `
+                -PluginRoot $pluginRoot `
+                -DataDir $script:dataDir `
+                -CodexHome $codexHome `
+                -RequestPath $requestPath `
+                -ResourceSnapshot @($deniedSnapshot, $recoveredSnapshot) `
+                -ResourceRetryDelaysSeconds 1
+            $stopwatch.Stop()
+
+            $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
+            $payload = $result.body | ConvertFrom-Json
+            $entry = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:dataDir 'logs\agent-bell.jsonl') | ConvertFrom-Json
+            $result.path | Should Be '/prewarm'
+            $payload.text | Should Be '主人，资源恢复测试会话 任务已完成，请回来查看了。'
+            ($stopwatch.ElapsedMilliseconds -ge 800) | Should Be $true
+            ($stopwatch.ElapsedMilliseconds -lt 4000) | Should Be $true
+            $entry.message | Should Be 'Requested custom voice prewarm'
+            $entry.data.status | Should Be 'accepted'
+            $entry.data.attempt | Should Be 2
             ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($privateTitle))
             ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($sessionId))
             ($entry | ConvertTo-Json -Compress -Depth 5) | Should Not Match ([regex]::Escape($turnId))
