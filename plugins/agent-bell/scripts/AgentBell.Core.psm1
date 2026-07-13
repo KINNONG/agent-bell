@@ -282,6 +282,19 @@ function Get-AgentBellPrewarmSlotNames {
     )
 }
 
+function Get-AgentBellPrewarmWaiterSlotNames {
+    param([Parameter(Mandatory = $true)][string]$DataDir)
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/').ToLowerInvariant()
+    $dataDirectoryHash = Get-AgentBellHash -Value $normalizedPath
+    return @(
+        "Local\AgentBellPrewarmWaiter-$dataDirectoryHash-0",
+        "Local\AgentBellPrewarmWaiter-$dataDirectoryHash-1",
+        "Local\AgentBellPrewarmWaiter-$dataDirectoryHash-2",
+        "Local\AgentBellPrewarmWaiter-$dataDirectoryHash-3"
+    )
+}
+
 function Invoke-AgentBellNvidiaSmiResourceQuery {
     $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction Stop | Select-Object -First 1
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -370,7 +383,7 @@ function Get-AgentBellPrewarmResourceDecision {
         $metrics.gpu_utilization_percent -lt 0 -or $metrics.gpu_utilization_percent -gt 100) {
         return $unavailable
     }
-    if ($metrics.available_memory_bytes -lt 2GB) {
+    if ($metrics.available_memory_bytes -lt 1536MB) {
         return [pscustomobject][ordered]@{ allowed = $false; reason = "memory_low" }
     }
     if ($metrics.cpu_percent -gt 75) {
@@ -1490,6 +1503,7 @@ Export-ModuleMember -Function @(
     "ConvertTo-AgentBellSafeLogData",
     "Write-AgentBellLog",
     "Get-AgentBellPrewarmSlotNames",
+    "Get-AgentBellPrewarmWaiterSlotNames",
     "Get-AgentBellPrewarmResourceDecision",
     "Get-AgentBellResourceSnapshot",
     "Normalize-AgentBellTitle",
