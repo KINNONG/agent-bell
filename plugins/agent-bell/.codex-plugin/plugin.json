@@ -1,6 +1,6 @@
 {
   "name": "agent-bell",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Windows-first voice notifications that call you back when Codex completes a turn or needs attention.",
   "author": {
     "name": "KINNONG"
