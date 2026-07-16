@@ -1440,6 +1440,11 @@ function Invoke-AgentBellHttpCompletion {
         Remove-Item -LiteralPath $wavPath -Force -ErrorAction SilentlyContinue
     }
 
+    if ([string]$Config.voice.fallback_provider -eq "sapi") {
+        Invoke-AgentBellSapi -Message $Message -Config $Config
+        return "sapi-fallback"
+    }
+
     return "http-cache-miss"
 }
 

@@ -525,7 +525,7 @@ Describe 'Agent Bell hook queue' {
         }
     }
 
-    It 'keeps an HTTP completion cache miss silent without a Windows system sound' {
+    It 'uses the configured SAPI fallback for an HTTP completion cache miss' {
         $port = Get-AgentBellTestPort
         $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"cache_miss"}')
         $server = Start-AgentBellTestServer -Port $port -StatusCode 404 -ContentType 'application/json' -ResponseBody $responseBody
@@ -534,16 +534,18 @@ Describe 'Agent Bell hook queue' {
             $config.voice.provider = 'http'
             $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
             $cacheDirectory = Join-Path $script:dataDir 'cache'
+            Mock Invoke-AgentBellSapi {} -ModuleName AgentBell.Core
 
             $provider = Invoke-AgentBellHttpCompletion `
-                -Message '主人，静默缓存测试 任务已完成，请回来查看了。' `
+                -Message '主人，缓存兜底测试 任务已完成，请回来查看了。' `
                 -Config $config `
                 -CacheDirectory $cacheDirectory
             $result = Receive-Job -Job (Wait-Job -Job $server -Timeout 5)
             $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $modulePath
 
-            $provider | Should Be 'http-cache-miss'
+            $provider | Should Be 'sapi-fallback'
             $result.path | Should Be '/cached'
+            Assert-MockCalled Invoke-AgentBellSapi -ModuleName AgentBell.Core -Times 1 -Exactly
             @(Get-ChildItem -LiteralPath $cacheDirectory -Filter '*.wav' -File -ErrorAction SilentlyContinue).Count | Should Be 0
             $source | Should Not Match 'SystemSounds'
             $source | Should Not Match 'Invoke-AgentBellInformationChime'
@@ -554,7 +556,7 @@ Describe 'Agent Bell hook queue' {
         }
     }
 
-    It 'logs a silent worker cache miss without private task metadata' {
+    It 'respects a disabled fallback and logs a cache miss without private task metadata' {
         $port = Get-AgentBellTestPort
         $responseBody = [System.Text.Encoding]::UTF8.GetBytes('{"error":"cache_miss"}')
         $server = Start-AgentBellTestServer -Port $port -StatusCode 404 -ContentType 'application/json' -ResponseBody $responseBody
@@ -562,6 +564,7 @@ Describe 'Agent Bell hook queue' {
             $config = Get-AgentBellDefaultConfig
             $config.stop_debounce_seconds = 0
             $config.voice.provider = 'http'
+            $config.voice.fallback_provider = 'none'
             $config.voice.http.endpoint = "http://127.0.0.1:$port/synthesize"
             Write-AgentBellJsonAtomic -Path (Join-Path $script:dataDir 'config.json') -Value $config
 
